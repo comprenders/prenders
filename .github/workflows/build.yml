@@ -1,0 +1,258 @@
+name: build
+
+# Builds of the app from its source repository, by hand only. This repository holds this file
+# and the releases; it holds no app code. The source is read with a read-only deploy key
+# (secret SOURCE_DEPLOY_KEY) from the repository named in the secret SOURCE_REPO.
+#
+# Each build is attached to a DRAFT PRERELEASE named `dev-<short sha>-<target>`. A draft has
+# no git tag, and nothing is published.
+#
+# The logs and the artifacts of each run are deleted after the run (`cleanup.yml`).
+#
+# No `push:`, no `pull_request:` and no `schedule:`. Only a person with write access to this
+# repository can start a run, so no other person can reach the secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of the source repository
+        required: true
+        default: master
+        type: string
+      target:
+        description: Which target to build
+        required: true
+        default: android
+        type: choice
+        options:
+          - android
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+          - x86_64-pc-windows-msvc
+
+permissions:
+  contents: read
+
+jobs:
+  # The one place that turns the input into a commit, so every later job builds the same
+  # commit even when the branch moves during the run.
+  resolve:
+    name: resolve the source commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the commit and require it on master for a signed APK
+        id: sha
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          if [ "$TARGET" = "android" ] && ! git merge-base --is-ancestor "$sha" origin/master; then
+            echo "build: the android target signs only commits on master; ${sha} is not on master." >&2
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "build: source commit ${sha}"
+
+  desktop:
+    name: build (${{ inputs.target }})
+    needs: resolve
+    if: ${{ !startsWith(inputs.target, 'android') }}
+    runs-on: >-
+      ${{ fromJSON('{"aarch64-apple-darwin":"macos-15","x86_64-apple-darwin":"macos-15-intel","x86_64-pc-windows-msvc":"windows-latest"}')[inputs.target] }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      BUNDLES: >-
+        ${{ fromJSON('{"aarch64-apple-darwin":"dmg,app","x86_64-apple-darwin":"dmg,app","x86_64-pc-windows-msvc":"nsis,msi"}')[inputs.target] }}
+      SRC_SHA: ${{ needs.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - name: Install backend dependencies
+        working-directory: backend
+        run: bun install --frozen-lockfile
+      - name: Build backend sidecar
+        working-directory: backend
+        env:
+          CHATMAN_RELEASE_REPO: ${{ github.repository }}
+          CHATMAN_RELEASE_TAG: ""
+        run: bun run build:sidecar:${{ inputs.target }}
+      - name: The built server starts
+        if: runner.os == 'macOS'
+        run: scripts/check-sidecar-starts.sh "src-tauri/binaries/chatman-${{ inputs.target }}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install frontend dependencies
+        working-directory: manager/web
+        run: npm ci
+      - name: Build frontend
+        working-directory: manager/web
+        env:
+          CHATMAN_RELEASE_REPO: ${{ github.repository }}
+          CHATMAN_RELEASE_TAG: ""
+        run: npm run build
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.target }}
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Build Tauri bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHATMAN_RELEASE_REPO: ${{ github.repository }}
+          CHATMAN_RELEASE_TAG: ""
+        with:
+          args: --target ${{ inputs.target }} --bundles ${{ env.BUNDLES }}
+      - name: Attach the installers to a draft prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          root="src-tauri/target/${TARGET}/release/bundle"
+          files=()
+          while IFS= read -r f; do files+=("$f"); done < <(
+            find "$root" -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \) | sort
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "build: no .dmg, .exe or .msi under ${root}; nothing to attach" >&2
+            exit 1
+          fi
+          GITHUB_SHA="$SRC_SHA" bash scripts/attach-dev-build.sh "$TARGET" \
+            "Unreleased build of ${SRC_SHA} for ${TARGET}. Draft prerelease: no tag, nothing published." \
+            "${files[@]}"
+
+  # Gradle runs here, so this job has no secret except the read-only source key, and only
+  # `contents: read`.
+  android-build:
+    name: build (android)
+    needs: resolve
+    if: ${{ inputs.target == 'android' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      ANDROID_BUILD_TOOLS_VERSION: 36.0.0
+      ANDROID_PLATFORM: android-36
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: 9.6.1
+      - name: Require the SDK packages
+        run: |
+          set -euo pipefail
+          for need in "build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2" "platforms/${ANDROID_PLATFORM}/android.jar"; do
+            if [ ! -f "${ANDROID_HOME}/${need}" ]; then
+              echo "build: ${ANDROID_HOME}/${need} is not on this runner image" >&2
+              exit 1
+            fi
+          done
+      - name: Test the Android app and build the unsigned release APK
+        run: gradle -p android --quiet testDebugUnitTest assembleRelease
+      - name: Check the package line of the APK
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          bash scripts/check-apk-badging.sh android/app/build/outputs/apk/release/app-release-unsigned.apk "$version"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-unsigned
+          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  # The signing secrets are only here, and no Gradle runs here.
+  android-sign:
+    name: sign (android)
+    needs: [resolve, android-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      ANDROID_BUILD_TOOLS_VERSION: 36.0.0
+      SRC_SHA: ${{ needs.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            android/release-cert.sha256
+            scripts/sign-apk.sh
+            scripts/attach-dev-build.sh
+            scripts/android-release-notes.sh
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-unsigned
+          path: ${{ runner.temp }}/android-unsigned
+      - name: Sign the APK and check its certificate
+        id: sign
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION: ${{ needs.android-build.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/signed"
+          signed="${RUNNER_TEMP}/signed/cc-chatman_${VERSION}_android.apk"
+          bash scripts/sign-apk.sh "${RUNNER_TEMP}/android-unsigned/app-release-unsigned.apk" "$signed" \
+            > "${RUNNER_TEMP}/sign.log"
+          digest=$(tail -n 1 "${RUNNER_TEMP}/sign.log")
+          {
+            echo "cert_sha256=${digest}"
+            echo "signed=${signed}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Attach the APK to a draft prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SIGNED: ${{ steps.sign.outputs.signed }}
+          CERT_SHA256: ${{ steps.sign.outputs.cert_sha256 }}
+        run: |
+          set -euo pipefail
+          notes=$(bash scripts/android-release-notes.sh "$(basename "$SIGNED")" "$CERT_SHA256")
+          GITHUB_SHA="$SRC_SHA" bash scripts/attach-dev-build.sh android "$notes" "$SIGNED"

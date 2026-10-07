@@ -1,0 +1,33 @@
+name: cleanup
+
+# After each run of `build`, delete the logs and the artifacts of that run. The build logs can
+# show lines of the source code (compiler warnings, failed tests), and the source is not public.
+
+on:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  # A failed run keeps its logs, so the cause can be read; the person who reads them deletes
+  # them by hand afterwards (`gh api -X DELETE repos/<repo>/actions/runs/<id>/logs`).
+  delete:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete the artifacts and the logs of the build run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          for id in $(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}/artifacts" --jq '.artifacts[].id'); do
+            gh api -X DELETE "repos/${GH_REPO}/actions/artifacts/${id}"
+          done
+          gh api -X DELETE "repos/${GH_REPO}/actions/runs/${RUN_ID}/logs"
+          echo "cleanup: deleted the artifacts and the logs of run ${RUN_ID}"
