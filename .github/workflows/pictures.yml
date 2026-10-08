@@ -1,0 +1,386 @@
+name: pictures
+
+# Pictures of the native Android screens, by hand only. The job builds the DEBUG APK of the
+# source repository, starts an Android emulator on the runner, installs the APK, and takes a
+# picture of each native screen in the light mode and in the dark mode, at 1080 x 2400 and
+# density 420. The pictures are one artifact with a retention of 1 day.
+#
+# The screens with a paired computer use the debug-only entry `DebugPicturesActivity`
+# (`android/app/src/debug/` of the source). It writes fake computers into the app storage
+# before it opens a screen. The release build has no such entry: the job checks this on the
+# release APK, and the source has the test `DebugEntryAbsentTest` (src/testRelease).
+#
+# This repository holds no app code. The job prints no source and no file list of the source.
+# A failed Gradle step can print lines of the source, so delete the logs of a failed run by
+# hand. `cleanup.yml` does not run after this workflow, because it would delete the artifact
+# before a person downloads it. After the download, delete the artifact and the logs by hand:
+#   gh api -X DELETE repos/<repo>/actions/artifacts/<artifact id>
+#   gh api -X DELETE repos/<repo>/actions/runs/<run id>/logs
+#
+# No `push:`, no `pull_request:` and no `schedule:`. Only a person with write access to this
+# repository can start a run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of the source repository
+        required: true
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  pictures:
+    name: pictures (android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      ANDROID_BUILD_TOOLS_VERSION: 36.0.0
+      ANDROID_PLATFORM: android-36
+      # The system image of the emulator. Android 15 (API 35), Google APIs, x86_64 for KVM.
+      SYSTEM_IMAGE: system-images;android-35;google_apis;x86_64
+      PKG: com.ccchatman.phone
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: 9.6.1
+      - name: Require the SDK packages
+        run: |
+          set -euo pipefail
+          for need in "build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2" "platforms/${ANDROID_PLATFORM}/android.jar" "platform-tools/adb" "cmdline-tools/latest/bin/sdkmanager"; do
+            if [ ! -f "${ANDROID_HOME}/${need}" ]; then
+              echo "pictures: ${ANDROID_HOME}/${need} is not on this runner image" >&2
+              exit 1
+            fi
+          done
+      # The debug test proves the class name; the release test proves that the release
+      # classes do not hold that class.
+      - name: Test the debug entry and build the debug and the release APK
+        run: >-
+          gradle -p android --quiet
+          testDebugUnitTest --tests com.ccchatman.phone.DebugEntryPresentTest
+          testReleaseUnitTest --tests com.ccchatman.phone.DebugEntryAbsentTest
+          assembleDebug assembleRelease
+      - name: The release APK has no debug entry, the debug APK has it
+        run: |
+          set -euo pipefail
+          aapt2="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2"
+          release=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          debug=android/app/build/outputs/apk/debug/app-debug.apk
+          has_entry() {
+            "$aapt2" dump xmltree --file AndroidManifest.xml "$1" | grep -q 'DebugPicturesActivity' && return 0
+            unzip -p "$1" 'classes*.dex' | grep -a -q 'Lcom/ccchatman/phone/DebugPicturesActivity;' && return 0
+            return 1
+          }
+          if has_entry "$release"; then
+            echo "pictures: the release APK holds DebugPicturesActivity" >&2
+            exit 1
+          fi
+          if ! has_entry "$debug"; then
+            echo "pictures: the debug APK has no DebugPicturesActivity, so the check above proves nothing" >&2
+            exit 1
+          fi
+          cp "$debug" "${RUNNER_TEMP}/app-debug.apk"
+          echo "pictures: the release APK has no debug entry"
+      - name: Allow KVM for the emulator
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install the emulator and the system image
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME}/cmdline-tools/latest/bin"
+          yes | "${sdk}/sdkmanager" --licenses > /dev/null || true
+          "${sdk}/sdkmanager" --install emulator "$SYSTEM_IMAGE" > /dev/null
+          echo no | "${sdk}/avdmanager" --silent create avd --force -n pictures -k "$SYSTEM_IMAGE" -d pixel_6
+          config="${HOME}/.android/avd/pictures.avd/config.ini"
+          # A phone size: 1080 x 2400 at density 420. A hardware keyboard, so that no soft
+          # keyboard covers a form. The emulated back camera, so the scanner has a camera.
+          sed -i -E '/^(hw\.lcd\.width|hw\.lcd\.height|hw\.lcd\.density|hw\.keyboard|hw\.camera\.back|hw\.camera\.front)=/d' "$config"
+          {
+            echo 'hw.lcd.width=1080'
+            echo 'hw.lcd.height=2400'
+            echo 'hw.lcd.density=420'
+            echo 'hw.keyboard=yes'
+            echo 'hw.camera.back=emulated'
+            echo 'hw.camera.front=none'
+          } >> "$config"
+      - name: Start the emulator
+        run: |
+          set -euo pipefail
+          nohup "${ANDROID_HOME}/emulator/emulator" -avd pictures -no-window -no-audio -no-boot-anim -no-snapshot \
+            -gpu swiftshader_indirect -camera-back emulated > "${RUNNER_TEMP}/emulator.log" 2>&1 &
+          adb="${ANDROID_HOME}/platform-tools/adb"
+          timeout 120 "$adb" wait-for-device
+          for _ in $(seq 1 150); do
+            if [ "$("$adb" shell getprop sys.boot_completed | tr -d '\r')" = "1" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$("$adb" shell getprop sys.boot_completed | tr -d '\r')" != "1" ]; then
+            echo "pictures: the emulator did not complete its boot in 300 s" >&2
+            exit 1
+          fi
+          "$adb" shell settings put global window_animation_scale 0
+          "$adb" shell settings put global transition_animation_scale 0
+          "$adb" shell settings put global animator_duration_scale 0
+          "$adb" shell svc power stayon true
+          "$adb" shell wm dismiss-keyguard
+          "$adb" shell wm size 1080x2400
+          "$adb" shell wm density 420
+          # The demo mode of the status bar: a fixed clock, full battery and signal, no other icons.
+          "$adb" shell settings put global sysui_demo_allowed 1
+          "$adb" shell am broadcast -a com.android.systemui.demo -e command enter > /dev/null
+          "$adb" shell am broadcast -a com.android.systemui.demo -e command clock -e hhmm 1200 > /dev/null
+          "$adb" shell am broadcast -a com.android.systemui.demo -e command battery -e level 100 -e plugged false > /dev/null
+          "$adb" shell am broadcast -a com.android.systemui.demo -e command network -e wifi show -e level 4 > /dev/null
+          "$adb" shell am broadcast -a com.android.systemui.demo -e command notifications -e visible false > /dev/null
+          "$adb" install "${RUNNER_TEMP}/app-debug.apk" > /dev/null
+          echo "pictures: the emulator runs and the debug APK is installed"
+      - name: Take the pictures
+        run: |
+          set -euo pipefail
+          export PATH="${ANDROID_HOME}/platform-tools:${PATH}"
+          out="${RUNNER_TEMP}/pictures"
+          mkdir -p "${out}/light" "${out}/dark"
+
+          # Finds one node of a uiautomator dump and prints the centre of its bounds.
+          # Kinds: text (equal text), prefix (text that starts with the value), edit (the
+          # EditText with this index). The text of the screen is not printed.
+          cat > "${RUNNER_TEMP}/find.py" <<'PY'
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path, kind, value = sys.argv[1:4]
+          nodes = list(ET.parse(path).iter("node"))
+          if kind == "text":
+              hits = [n for n in nodes if n.get("text", "").strip().lower() == value.lower()]
+          elif kind == "prefix":
+              hits = [n for n in nodes if n.get("text", "").strip().lower().startswith(value.lower())]
+          elif kind == "edit":
+              edits = [n for n in nodes if n.get("class") == "android.widget.EditText"]
+              hits = edits[int(value):int(value) + 1]
+          else:
+              sys.exit(f"find: the kind {kind} is not text, prefix or edit")
+          if not hits:
+              sys.exit(f"find: no node for {kind} {value}")
+          x1, y1, x2, y2 = map(int, re.findall(r"\d+", hits[0].get("bounds")))
+          print((x1 + x2) // 2, (y1 + y2) // 2)
+          PY
+
+          # Clears the app data and the runtime permissions, so each scene starts from a new install.
+          fresh() {
+            adb shell am force-stop "$PKG"
+            adb shell pm clear "$PKG" > /dev/null
+            adb shell pm revoke "$PKG" android.permission.POST_NOTIFICATIONS
+            adb shell pm revoke "$PKG" android.permission.CAMERA
+          }
+          # Starts the debug entry with these extras (see DebugPicturesActivity).
+          entry() {
+            adb shell am start -W -n "${PKG}/.DebugPicturesActivity" "$@" > /dev/null
+          }
+          shot() {
+            local file="${out}/${MODE}/$1.png"
+            adb exec-out screencap -p > "$file"
+            if [ ! -s "$file" ]; then
+              echo "pictures: the picture ${MODE}/$1 is empty" >&2
+              return 1
+            fi
+            echo "pictures: ${MODE}/$1"
+          }
+          # Taps the first node that `find.py` finds. A dump can fail while the screen changes, so three tries.
+          tap() {
+            local xy=""
+            for _ in 1 2 3; do
+              if adb shell uiautomator dump /sdcard/ui.xml > /dev/null 2>&1 && adb pull /sdcard/ui.xml "${RUNNER_TEMP}/ui.xml" > /dev/null 2>&1; then
+                if xy=$(python3 "${RUNNER_TEMP}/find.py" "${RUNNER_TEMP}/ui.xml" "$1" "$2"); then
+                  break
+                fi
+              fi
+              xy=""
+              sleep 2
+            done
+            if [ -z "$xy" ]; then
+              echo "pictures: no node for $1 $2 in ${MODE}" >&2
+              return 1
+            fi
+            # shellcheck disable=SC2086
+            adb shell input tap $xy
+          }
+
+          s_first_run() {
+            fresh
+            adb shell am start -W -n "${PKG}/.LauncherActivity" > /dev/null
+            sleep 3
+            shot 01-launcher-first-run-step-1
+            tap text "Start"
+            sleep 2
+            shot 02-first-run-tailscale-check
+          }
+          s_pair_no_computer() {
+            fresh
+            entry --es scene main
+            sleep 4
+            shot 03-pair-no-computer
+            tap text "Scan the code"
+            sleep 2
+            shot 04-scanner-camera-question
+            tap text "Continue"
+            sleep 2
+            shot 05-scanner-android-camera-dialog
+          }
+          s_scanner_denied() {
+            fresh
+            entry --es scene scan --ez camera_asked true
+            sleep 2
+            shot 06-scanner-camera-denied
+          }
+          s_scanner_live() {
+            fresh
+            adb shell pm grant "$PKG" android.permission.CAMERA
+            entry --es scene scan
+            sleep 6
+            shot 07-scanner-live
+          }
+          s_type_name() {
+            fresh
+            entry --es scene main --es open type_address
+            sleep 3
+            shot 08-type-name-empty
+            tap edit 0
+            adb shell input text bad-name
+            tap edit 1
+            adb shell input text 1
+            tap text "Pair"
+            sleep 1
+            shot 09-type-name-error
+            tap text "Scan with the camera app"
+            sleep 1
+            shot 10-type-name-camera-app-steps
+          }
+          s_pair_link() {
+            fresh
+            adb shell am start -W -a android.intent.action.VIEW -d ccchatman://pair -n "${PKG}/.PairEntryActivity" --es origin not-an-address > /dev/null
+            sleep 2
+            shot 11-pair-link-wrong-address
+            fresh
+            adb shell am start -W -a android.intent.action.VIEW -d ccchatman://pair -n "${PKG}/.PairEntryActivity" \
+              --es origin https://desk-one.tail-fake.ts.net --es pair_code x > /dev/null
+            sleep 2
+            shot 12-pair-link-wrong-code
+          }
+          settings_shot() {
+            local name=$1
+            shift
+            fresh
+            entry --es scene settings "$@"
+            sleep 3
+            shot "$name"
+          }
+          s_settings() {
+            settings_shot 13-settings-no-computer
+            settings_shot 14-settings-one-connected --es computers connected
+            settings_shot 15-settings-one-not-reachable --es computers unreachable
+            settings_shot 16-settings-connection-off --es computers connected --es connection off
+            settings_shot 17-settings-two-computers --es computers connected,unreachable
+            adb shell input swipe 540 1900 540 500 300
+            sleep 1
+            shot 17b-settings-two-computers-scrolled
+            settings_shot 18-settings-update-ready --es computers connected_update
+            settings_shot 19-settings-app-newer --es computers connected_newer
+            settings_shot 20-settings-stopped-by-android --es computers connected --ez last_stop true
+            fresh
+            entry --es scene settings --es computers connected
+            sleep 3
+            tap text "Remove from this app"
+            sleep 1
+            shot 21-settings-remove-dialog
+          }
+          s_main_one() {
+            fresh
+            adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS
+            entry --es scene main --es computers unreachable
+            sleep 10
+            shot 22-main-one-computer-page-failed
+            adb shell cmd statusbar expand-notifications
+            sleep 2
+            shot 23-notification-shade
+            adb shell cmd statusbar collapse
+          }
+          s_main_two() {
+            fresh
+            entry --es scene main --es computers unreachable,unreachable
+            sleep 10
+            shot 24-main-two-computers-page-failed
+            if ! tap text "Show another computer"; then
+              tap prefix "desk-one "
+            fi
+            sleep 1
+            shot 25-computers-dialog
+          }
+          s_main_open() {
+            local name=$1
+            shift
+            fresh
+            entry --es scene main --es computers unreachable "$@"
+            sleep 4
+            shot "$name"
+          }
+          s_main_others() {
+            s_main_open 26-add-computer --es open add_computer
+            s_main_open 27-pair-again --es open pair_again
+            s_main_open 28-tap-of-removed-computer-dialog --es open tap_removed
+            s_main_open 29-crash-dialog --ez crash true
+          }
+
+          failed=()
+          scene() {
+            set +e
+            ( set -e; "$1" )
+            local rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              echo "pictures: the scene $1 failed in ${MODE}" >&2
+              failed+=("${MODE}/$1")
+            fi
+          }
+
+          for MODE in light dark; do
+            if [ "$MODE" = dark ]; then adb shell cmd uimode night yes > /dev/null; else adb shell cmd uimode night no > /dev/null; fi
+            for s in s_first_run s_pair_no_computer s_scanner_denied s_scanner_live s_type_name s_pair_link s_settings s_main_one s_main_two s_main_others; do
+              scene "$s"
+            done
+          done
+
+          # The log of the device goes into the artifact, not into the run log.
+          adb logcat -d > "${out}/logcat.txt" 2>&1 || true
+          cp "${RUNNER_TEMP}/emulator.log" "${out}/emulator.log"
+          printf '%s\n' "${failed[@]}" > "${out}/failed-scenes.txt"
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "pictures: ${#failed[@]} scenes failed: ${failed[*]}" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-pictures
+          path: ${{ runner.temp }}/pictures
+          if-no-files-found: error
+          retention-days: 1
