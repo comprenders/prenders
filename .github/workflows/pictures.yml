@@ -160,6 +160,7 @@ jobs:
           "$adb" install "${RUNNER_TEMP}/app-debug.apk" > /dev/null
           echo "pictures: the emulator runs and the debug APK is installed"
       - name: Take the pictures
+        timeout-minutes: 40
         run: |
           set -euo pipefail
           export PATH="${ANDROID_HOME}/platform-tools:${PATH}"
@@ -191,6 +192,9 @@ jobs:
           print((x1 + x2) // 2, (y1 + y2) // 2)
           PY
 
+          # Every phone command gets a time limit, so a command that waits for a screen cannot
+          # hold the job. A command over the limit fails its scene, and the next scene runs.
+          adb() { timeout 90 "${ANDROID_HOME}/platform-tools/adb" "$@"; }
           # Clears the app data and the runtime permissions, so each scene starts from a new install.
           fresh() {
             adb shell am force-stop "$PKG"
@@ -335,6 +339,10 @@ jobs:
             entry --es scene main --es computers unreachable,unreachable
             sleep 10
             shot 24-main-two-computers-page-failed
+            # The forced stop of the script can show the "Stopped by Android" dialog over the
+            # page. The picture above keeps it as evidence; close it before the next tap.
+            tap text "OK" || true
+            sleep 1
             if ! tap text "Show another computer"; then
               tap prefix "desk-one "
             fi
@@ -369,6 +377,7 @@ jobs:
           }
 
           for MODE in light dark; do
+            adb shell input keyevent KEYCODE_HOME > /dev/null || true
             if [ "$MODE" = dark ]; then adb shell cmd uimode night yes > /dev/null; else adb shell cmd uimode night no > /dev/null; fi
             for s in s_first_run s_pair_no_computer s_scanner_denied s_scanner_live s_type_name s_pair_link s_settings s_main_one s_main_two s_main_others; do
               scene "$s"
