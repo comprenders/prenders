@@ -102,8 +102,19 @@ jobs:
           sdk="${ANDROID_HOME}/cmdline-tools/latest/bin"
           yes | "${sdk}/sdkmanager" --licenses > /dev/null || true
           "${sdk}/sdkmanager" --install emulator "$SYSTEM_IMAGE" > /dev/null
-          echo no | "${sdk}/avdmanager" --silent create avd --force -n pictures -k "$SYSTEM_IMAGE" -d pixel_6
-          config="${HOME}/.android/avd/pictures.avd/config.ini"
+          # The runner image sets its own Android user folder, so the step names the AVD folder
+          # itself. The emulator step reads the same folder from GITHUB_ENV.
+          export ANDROID_AVD_HOME="${RUNNER_TEMP}/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo "ANDROID_AVD_HOME=${ANDROID_AVD_HOME}" >> "$GITHUB_ENV"
+          echo no | "${sdk}/avdmanager" --silent create avd --force -n pictures -k "$SYSTEM_IMAGE" -d pixel_6 \
+            -p "${ANDROID_AVD_HOME}/pictures.avd"
+          config="${ANDROID_AVD_HOME}/pictures.avd/config.ini"
+          if [ ! -f "$config" ]; then
+            echo "pictures: no AVD config at the named folder; the AVDs that exist:" >&2
+            "${sdk}/avdmanager" list avd >&2
+            exit 1
+          fi
           # A phone size: 1080 x 2400 at density 420. A hardware keyboard, so that no soft
           # keyboard covers a form. The emulated back camera, so the scanner has a camera.
           sed -i -E '/^(hw\.lcd\.width|hw\.lcd\.height|hw\.lcd\.density|hw\.keyboard|hw\.camera\.back|hw\.camera\.front)=/d' "$config"
