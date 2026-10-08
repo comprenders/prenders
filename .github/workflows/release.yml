@@ -1,0 +1,657 @@
+name: release
+
+# A release of the app, by hand only. `scripts/release.sh <version>` of the source
+# repository pushes the tag `v<version>` there and starts this workflow with that tag.
+# This repository holds the workflow files and the releases; it holds no app code. The
+# source is read with a read-only deploy key (secret SOURCE_DEPLOY_KEY) from the
+# repository named in the secret SOURCE_REPO.
+#
+# The jobs are the jobs of the release run of `.github/workflows/ci.yml` of the source
+# repository, which has no tag trigger since 2026-10-08. The reasons for each step are in
+# the comments of that file; this file gives only what is different here. The steps of
+# `publish` that touch the release are in `scripts/publish-release.sh` of the source, and
+# ci.yml runs the same script.
+#
+# Every job builds the commit that `resolve` found for the tag, never the tag name, so a
+# tag that moves during the run changes nothing.
+#
+# With `draft: true` the run makes a DRAFT release with the name of the tag. A draft has
+# no git tag and only a person with push access can see it, so nothing is published.
+#
+# The logs and the artifacts of a successful run are deleted after the run
+# (`cleanup.yml`).
+#
+# No `push:`, no `pull_request:` and no `schedule:`. Only a person with write access to
+# this repository can start a run, so no other person can reach the secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: A v* tag of the source repository (its commit must be on master)
+        required: true
+        type: string
+      draft:
+        description: Make a draft release, for a test run (nothing is published)
+        required: false
+        default: false
+        type: boolean
+
+run-name: release ${{ inputs.tag }}${{ inputs.draft && ' (draft)' || '' }}
+
+permissions:
+  contents: read
+
+# Two runs for one tag could each find no release and each create one. The second run
+# waits for the first.
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # The one place that turns the tag into a commit. It refuses unless the tag exists in
+  # the source repository and its commit is on master (the signing rule of `build.yml`).
+  resolve:
+    name: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Refuse a tag that is not v and a version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9A-Za-z.-]+$ ]]; then
+            echo "release: the tag \"${TAG}\" is not v followed by a version" >&2
+            exit 1
+          fi
+      # No `ref:`, so the default branch of the source. `fetch-depth: 0` fetches every
+      # branch and every tag, so the tag and origin/master are both here.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the tag and require its commit on master
+        id: sha
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! sha=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+            echo "release: the source repository has no tag ${TAG}" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$sha" origin/master; then
+            echo "release: the tag ${TAG} is at ${sha}, which is not on master; a release signs only commits on master" >&2
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "release: ${TAG} is the source commit ${sha}"
+
+  # The private ci.yml lints its own workflow files. Here the release path is the files
+  # of THIS repository, so this job lints them: a malformed expression, an unknown
+  # `needs:` or a matrix key that is not defined can survive the parse of GitHub and give
+  # an empty value instead of an error. The same pinned versions and digests as ci.yml.
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+      SHELLCHECK_VERSION: 0.11.0
+      SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${tarball}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}" actionlint
+          "${RUNNER_TEMP}/actionlint" -version
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          tarball="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${tarball}" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${tarball}"
+          echo "${SHELLCHECK_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}" --strip-components=1 \
+            "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          "${RUNNER_TEMP}/shellcheck" --version
+      - name: Lint every workflow file
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/actionlint" -color \
+            -shellcheck="${RUNNER_TEMP}/shellcheck" -pyflakes=
+
+  versions:
+    name: versions
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Versions agree with each other and with the tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: node scripts/check-versions.mjs --tag "$TAG"
+
+  backend:
+    name: backend (${{ matrix.os }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - name: Install backend dependencies
+        working-directory: backend
+        run: bun install --frozen-lockfile
+      - name: Type-check backend
+        working-directory: backend
+        run: bun run typecheck
+      - name: Test backend
+        working-directory: backend
+        run: bun run test
+
+  # The only job that runs the shipped runtime on Windows. The units, their timeouts and
+  # their `if:` conditions are those of ci.yml; the reasons are there.
+  smoke-windows:
+    name: smoke-windows
+    needs: resolve
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Resolve the smoke paths (outside the checkout)
+        id: paths
+        env:
+          EXPECTED_OUT: ${{ runner.temp }}\chatman-smoke-out
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrEmpty($env:RUNNER_TEMP)) { throw 'RUNNER_TEMP is empty' }
+          $root     = Join-Path $env:RUNNER_TEMP 'chatman-smoke'
+          $out      = Join-Path $env:RUNNER_TEMP 'chatman-smoke-out'
+          $manifest = Join-Path $out 'fixture-manifest.json'
+          if ($out -cne $env:EXPECTED_OUT) {
+            throw "smoke output dir '$out' disagrees with the artefact-upload path '$($env:EXPECTED_OUT)'"
+          }
+          $enc = New-Object System.Text.UTF8Encoding($false)
+          $lines = "SMOKE_ROOT=$root`r`nSMOKE_OUT=$out`r`nSMOKE_MANIFEST=$manifest`r`n"
+          [IO.File]::AppendAllText($env:GITHUB_ENV, $lines, $enc)
+          Write-Host $lines
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install backend dependencies
+        id: deps
+        working-directory: backend
+        run: bun install --frozen-lockfile
+
+      - name: Unit 0 - static-check the smoke scripts (parse + unassigned reads)
+        id: lint
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        env:
+          SMOKE_UNIT: '0'
+        run: .\.github\smoke-windows\check-scripts.ps1
+
+      - name: Unit 2 - build the Windows sidecar and check its exact path
+        id: build
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          SMOKE_UNIT: '2'
+        run: .\.github\smoke-windows\assert-sidecar-build.ps1 -RepoRoot "${{ github.workspace }}"
+
+      - name: Unit 3 - lay the hostile fixture (long path, junction, cycle, credential)
+        id: fixture
+        if: ${{ !cancelled() && steps.paths.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          SMOKE_UNIT: '3'
+        run: >-
+          .\.github\smoke-windows\lay-fixture.ps1
+          -Root "$env:SMOKE_ROOT" -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST"
+
+      - name: Unit 3 + 4b - run the shipped .exe against the fixture
+        id: api
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.fixture.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          SMOKE_UNIT: 3b
+        run: >-
+          .\.github\smoke-windows\assert-api.ps1
+          -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST" -LogDir "$env:SMOKE_OUT"
+
+      # The timeout of this step must stay equal to the one of the same step in ci.yml:
+      # `assert-launcher.ps1` checks its own worst case against it.
+      - name: Unit 4a - launch through real PowerShell and check the argv it delivered
+        id: launcher
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          SMOKE_UNIT: 4a
+        run: >-
+          .\.github\smoke-windows\assert-launcher.ps1
+          -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST" -LogDir "$env:SMOKE_OUT"
+
+      - name: Unit 5 - execute the keep-awake payload and check the orphan guard
+        id: keepawake
+        if: ${{ !cancelled() && steps.paths.outcome == 'success' && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          SMOKE_UNIT: '5'
+        run: >-
+          .\.github\smoke-windows\assert-keepawake.ps1
+          -RepoRoot "${{ github.workspace }}" -LogDir "$env:SMOKE_OUT"
+
+      - name: Unit 6 - the errno Windows gives for an unreadable root and a symlink cycle
+        id: errno
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          SMOKE_UNIT: '6'
+        run: >-
+          .\.github\smoke-windows\assert-root-errno.ps1
+          -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST" -LogDir "$env:SMOKE_OUT"
+
+      # One day, not the 30 of ci.yml: the artifacts of a successful run are deleted by
+      # `cleanup.yml`, and a failed run is read the same day.
+      - name: Upload smoke artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-windows-artefacts
+          path: ${{ runner.temp }}\chatman-smoke-out
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Every unit that ran contributed a ledger
+        if: always()
+        timeout-minutes: 5
+        env:
+          UNIT_OUTCOMES: >-
+            {"0":"${{ steps.lint.outcome }}",
+            "2":"${{ steps.build.outcome }}",
+            "3":"${{ steps.fixture.outcome }}",
+            "3b":"${{ steps.api.outcome }}",
+            "4a":"${{ steps.launcher.outcome }}",
+            "5":"${{ steps.keepawake.outcome }}",
+            "6":"${{ steps.errno.outcome }}"}
+        run: >-
+          .\.github\smoke-windows\assert-units-reported.ps1
+          -LogDir "$env:SMOKE_OUT" -Outcomes "$env:UNIT_OUTCOMES"
+
+  frontend:
+    name: frontend
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: manager/web/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: manager/web
+        run: npm ci
+      - name: Build frontend
+        working-directory: manager/web
+        run: npm run build
+      - name: Test frontend
+        working-directory: manager/web
+        run: npm test
+      - name: Audit frontend dependencies
+        working-directory: manager/web
+        run: npm audit --audit-level=high
+
+  python:
+    name: python (${{ matrix.python-version }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The `tray` extra pulls rumps, which is macOS-only, so it is not installed here.
+      - name: Install Python package
+        run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check manager tools
+      - name: Type-check
+        run: pyright manager tools
+      - name: Test
+        run: pytest manager/tests tools/tests --tb=short -q
+
+  # Build only: tauri-action gets no `tagName` and no `releaseId`, so it makes no
+  # release-API call. The release is made by `publish`, once, after every check.
+  # CHATMAN_RELEASE_REPO is THIS repository, because the releases are here.
+  bundle:
+    name: bundle (${{ matrix.triple }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            triple: aarch64-apple-darwin
+            bundles: dmg,app
+            artifact_glob: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+            bundles: dmg,app
+            artifact_glob: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            artifact_glob: |-
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - name: Install backend dependencies
+        working-directory: backend
+        run: bun install --frozen-lockfile
+      - name: Build backend sidecar
+        working-directory: backend
+        env:
+          CHATMAN_RELEASE_REPO: ${{ github.repository }}
+          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+        run: bun run build:sidecar:${{ matrix.triple }}
+      - name: The built server starts
+        if: runner.os == 'macOS'
+        run: scripts/check-sidecar-starts.sh "src-tauri/binaries/chatman-${{ matrix.triple }}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: manager/web/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: manager/web
+        run: npm ci
+      - name: Build frontend
+        working-directory: manager/web
+        env:
+          CHATMAN_RELEASE_REPO: ${{ github.repository }}
+          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+        run: npm run build
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Build Tauri bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHATMAN_RELEASE_REPO: ${{ github.repository }}
+          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+        with:
+          args: --target ${{ matrix.triple }} --bundles ${{ matrix.bundles }}
+      # The same string that the upload expands, so a changed bundle layout fails here
+      # with a sentence, and not as an empty release.
+      - name: Refuse unless the upload glob matches something
+        shell: bash
+        env:
+          ARTIFACT_GLOB: ${{ matrix.artifact_glob }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          missing=""
+          total=0
+          while IFS= read -r pattern; do
+            [ -n "$pattern" ] || continue
+            # shellcheck disable=SC2206
+            # Unquoted ON PURPOSE: this line is the glob expansion being asserted.
+            matches=($pattern)
+            echo "  ${pattern} -> ${#matches[@]}"
+            total=$((total + ${#matches[@]}))
+            if [ "${#matches[@]}" -eq 0 ]; then
+              missing="${missing} ${pattern}"
+            fi
+          done <<< "$ARTIFACT_GLOB"
+          if [ -n "$missing" ]; then
+            echo "bundle: the upload glob matches nothing on ${TRIPLE}:${missing}" >&2
+            echo "bundle: the release path would be empty; the bundle output layout changed" >&2
+            exit 1
+          fi
+          echo "bundle: ${total} file(s) match the upload glob for ${TRIPLE}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.triple }}
+          path: ${{ matrix.artifact_glob }}
+          if-no-files-found: error
+          retention-days: 2
+
+  # Gradle runs here, so this job has no secret except the read-only source key, only
+  # `contents: read`, and `persist-credentials: false`. The signing secrets are in
+  # `android-sign`, on another runner.
+  android:
+    name: android
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      ANDROID_BUILD_TOOLS_VERSION: 36.0.0
+      ANDROID_PLATFORM: android-36
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: 9.6.1
+      - name: Require the SDK packages
+        run: |
+          set -euo pipefail
+          for need in "build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2" "platforms/${ANDROID_PLATFORM}/android.jar"; do
+            if [ ! -f "${ANDROID_HOME}/${need}" ]; then
+              echo "android: ${ANDROID_HOME}/${need} is not on this runner image; the job installs no SDK package" >&2
+              exit 1
+            fi
+          done
+      - name: Test the Android app
+        run: gradle -p android testDebugUnitTest
+      - name: Build the unsigned release APK
+        run: gradle -p android assembleRelease
+      - name: Check the package line of the APK
+        run: |
+          set -euo pipefail
+          bash scripts/check-apk-badging.sh android/app/build/outputs/apk/release/app-release-unsigned.apk \
+            "$(jq -r .version src-tauri/tauri.conf.json)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-unsigned
+          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 2
+
+  # The signing secrets are only here, and no Gradle runs here. The sparse checkout holds
+  # only the expected digest and the sign script.
+  android-sign:
+    name: android-sign
+    needs: [resolve, android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      cert_sha256: ${{ steps.sign.outputs.cert_sha256 }}
+    env:
+      ANDROID_BUILD_TOOLS_VERSION: 36.0.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            android/release-cert.sha256
+            scripts/sign-apk.sh
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-unsigned
+          path: ${{ runner.temp }}/android-unsigned
+      # The secrets go through `env:` to this one step. The script prints the digest as
+      # its last line and never prints a secret.
+      - name: Sign the APK and check its certificate
+        id: sign
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p "${RUNNER_TEMP}/signed"
+          signed="${RUNNER_TEMP}/signed/cc-chatman_${version}_android.apk"
+          bash scripts/sign-apk.sh "${RUNNER_TEMP}/android-unsigned/app-release-unsigned.apk" "$signed" \
+            | tee "${RUNNER_TEMP}/sign.log"
+          digest=$(tail -n 1 "${RUNNER_TEMP}/sign.log")
+          echo "cert_sha256=${digest}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-android
+          path: ${{ runner.temp }}/signed/*.apk
+          if-no-files-found: error
+          retention-days: 2
+
+  # The release is made here and nowhere else, after every other job. `!cancelled()`: a
+  # failed job does not skip this job; the first step names it and refuses.
+  publish:
+    name: publish
+    needs: [resolve, actionlint, versions, backend, smoke-windows, frontend, python, bundle, android, android-sign]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      MODE: ${{ inputs.draft && 'draft' || 'release' }}
+      SRC_SHA: ${{ needs.resolve.outputs.sha }}
+      CERT_SHA256: ${{ needs.android-sign.outputs.cert_sha256 }}
+    steps:
+      # The scripts of the release steps, from the source. When `resolve` failed, its
+      # output is empty and this is the default branch of the source; the next step
+      # then refuses, because `resolve` did not succeed.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/check-release-set.sh
+            scripts/android-release-notes.sh
+            scripts/publish-release.sh
+          sparse-checkout-cone-mode: false
+      - name: Refuse if any job did not succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: bash scripts/publish-release.sh needs "$TAG"
+      # `pattern` + `merge-multiple`: the smoke artefacts must not go into the release.
+      - name: Download the bundle artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          merge-multiple: true
+          path: dist
+      - name: List the downloaded files
+        run: |
+          set -euo pipefail
+          find dist -type f | sort > "${RUNNER_TEMP}/files.txt"
+          echo "Downloaded bundle files:"
+          awk '{ printf "  %s\n", $0 } END { printf "  (%d files)\n", NR }' "${RUNNER_TEMP}/files.txt"
+      - name: Refuse unless the bundle set is complete
+        run: bash scripts/check-release-set.sh files "$TAG" "${RUNNER_TEMP}/files.txt"
+      - name: Create the release if it does not exist
+        run: bash scripts/publish-release.sh create "$MODE" "$TAG" "${RUNNER_TEMP}/files.txt" "$CERT_SHA256" "$SRC_SHA"
+      - name: Upload the bundles
+        run: bash scripts/publish-release.sh upload "$TAG" "${RUNNER_TEMP}/files.txt"
+      - name: Verify the release carries the complete set
+        run: bash scripts/publish-release.sh verify "$MODE" "$TAG"

@@ -1,11 +1,13 @@
 name: cleanup
 
-# After each run of `build`, delete the logs and the artifacts of that run. The build logs can
-# show lines of the source code (compiler warnings, failed tests), and the source is not public.
+# After each run of `build` and of `release`, delete the logs and the artifacts of that run.
+# The logs can show lines of the source code (compiler warnings, failed tests), and the source
+# is not public. The artifacts of a `release` run are used by its own `publish` job, so they
+# have no use after the run.
 
 on:
   workflow_run:
-    workflows: [build]
+    workflows: [build, release]
     types: [completed]
 
 permissions:
@@ -19,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Delete the artifacts and the logs of the build run
+      - name: Delete the artifacts and the logs of the run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
