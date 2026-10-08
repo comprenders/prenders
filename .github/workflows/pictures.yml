@@ -8,7 +8,7 @@ name: pictures
 # The screens with a paired computer use the debug-only entry `DebugPicturesActivity`
 # (`android/app/src/debug/` of the source). It writes fake computers into the app storage
 # before it opens a screen. The release build has no such entry: the job checks this on the
-# release APK, and the source has the test `DebugEntryAbsentTest` (src/testRelease).
+# release APK.
 #
 # This repository holds no app code. The job prints no source and no file list of the source.
 # A failed Gradle step can print lines of the source, so delete the logs of a failed run by
@@ -66,14 +66,9 @@ jobs:
               exit 1
             fi
           done
-      # The debug test proves the class name; the release test proves that the release
-      # classes do not hold that class.
-      - name: Test the debug entry and build the debug and the release APK
-        run: >-
-          gradle -p android --quiet
-          testDebugUnitTest --tests com.ccchatman.phone.DebugEntryPresentTest
-          testReleaseUnitTest --tests com.ccchatman.phone.DebugEntryAbsentTest
-          assembleDebug assembleRelease
+      # The next step checks the two APKs: the release APK has no debug entry.
+      - name: Build the debug and the release APK
+        run: gradle -p android --quiet assembleDebug assembleRelease
       - name: The release APK has no debug entry, the debug APK has it
         run: |
           set -euo pipefail
