@@ -4,8 +4,15 @@ name: build
 # and the releases; it holds no app code. The source is read with a read-only deploy key
 # (secret SOURCE_DEPLOY_KEY) from the repository named in the secret SOURCE_REPO.
 #
-# Each build is attached to a DRAFT PRERELEASE named `dev-<short sha>-<target>`. A draft has
-# no git tag, and nothing is published.
+# One run makes ONE draft prerelease named `dev-<short sha>`, with the files of every target
+# of the run, as a release page lists all the platforms. The job `resolve` creates the draft
+# once (`scripts/attach-dev-build.sh create` of the source); each build job then only
+# uploads into it (`attach-dev-build.sh upload`), so the parallel jobs do not race to create
+# it. A later run for the same commit, also with one target, uploads into the same draft. A
+# draft has no git tag, and nothing is published. The name never starts with `v`.
+#
+# The source commit must have the `create`/`upload` form of `scripts/attach-dev-build.sh`
+# (2026-10-08). For an older commit, `resolve` fails at the create.
 #
 # The logs and the artifacts of each run are deleted after the run (`cleanup.yml`).
 #
@@ -37,11 +44,14 @@ permissions:
 
 jobs:
   # The one place that turns the input into a commit, so every later job builds the same
-  # commit even when the branch moves during the run.
+  # commit even when the branch moves during the run. It also creates the one draft of the
+  # run, before any build job starts, so `contents: write`.
   resolve:
     name: resolve the source commit
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
       desktop: ${{ steps.sha.outputs.desktop }}
@@ -72,6 +82,30 @@ jobs:
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "desktop=${desktop}" >> "$GITHUB_OUTPUT"
           echo "build: source commit ${sha}"
+      # The notes name the targets of this run. With android, they also give the install
+      # lines of the APK with the certificate digest of `android/release-cert.sha256`: the
+      # job `android-sign` refuses an APK whose certificate has another digest. The notes
+      # apply only when this run creates the draft.
+      - name: Create the draft prerelease of the commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ inputs.target }}
+          SRC_SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            all) targets="aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc, android" ;;
+            *) targets="$TARGET" ;;
+          esac
+          notes="Unreleased build of ${SRC_SHA}. Targets of the first run: ${targets}. Draft prerelease: no tag, nothing published."
+          if [ "$TARGET" = "android" ] || [ "$TARGET" = "all" ]; then
+            version=$(jq -r .version src-tauri/tauri.conf.json)
+            digest=$(tr -d '[:space:]' < android/release-cert.sha256)
+            apk_notes=$(bash scripts/android-release-notes.sh "cc-chatman_${version}_android.apk" "$digest")
+            notes="${notes}"$'\n\n'"${apk_notes}"
+          fi
+          GITHUB_SHA="$SRC_SHA" bash scripts/attach-dev-build.sh create "$notes"
 
   desktop:
     name: build (${{ matrix.target }})
@@ -138,7 +172,7 @@ jobs:
           CHATMAN_RELEASE_TAG: ""
         with:
           args: --target ${{ matrix.target }} --bundles ${{ env.BUNDLES }}
-      - name: Attach the installers to a draft prerelease
+      - name: Upload the installers into the draft prerelease of the commit
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -155,9 +189,7 @@ jobs:
             echo "build: no .dmg, .exe or .msi under ${root}; nothing to attach" >&2
             exit 1
           fi
-          GITHUB_SHA="$SRC_SHA" bash scripts/attach-dev-build.sh "$TARGET" \
-            "Unreleased build of ${SRC_SHA} for ${TARGET}. Draft prerelease: no tag, nothing published." \
-            "${files[@]}"
+          GITHUB_SHA="$SRC_SHA" bash scripts/attach-dev-build.sh upload "${files[@]}"
 
   # Gradle runs here, so this job has no secret except the read-only source key, and only
   # `contents: read`.
@@ -233,7 +265,6 @@ jobs:
             android/release-cert.sha256
             scripts/sign-apk.sh
             scripts/attach-dev-build.sh
-            scripts/android-release-notes.sh
           sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
@@ -258,13 +289,11 @@ jobs:
             echo "cert_sha256=${digest}"
             echo "signed=${signed}"
           } >> "$GITHUB_OUTPUT"
-      - name: Attach the APK to a draft prerelease
+      - name: Upload the APK into the draft prerelease of the commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           SIGNED: ${{ steps.sign.outputs.signed }}
-          CERT_SHA256: ${{ steps.sign.outputs.cert_sha256 }}
         run: |
           set -euo pipefail
-          notes=$(bash scripts/android-release-notes.sh "$(basename "$SIGNED")" "$CERT_SHA256")
-          GITHUB_SHA="$SRC_SHA" bash scripts/attach-dev-build.sh android "$notes" "$SIGNED"
+          GITHUB_SHA="$SRC_SHA" bash scripts/attach-dev-build.sh upload "$SIGNED"

@@ -1,7 +1,9 @@
 name: release
 
-# A release of the app, by hand only. `scripts/release.sh <version>` of the source
-# repository pushes the tag `v<version>` there and starts this workflow with that tag.
+# A release of the app, by hand only. `scripts/release.sh [--draft] major|minor|patch` of
+# the source repository computes the next version from the last release tag (semantic
+# versioning), commits it, pushes master, pushes the tag `v<version>` there and starts this
+# workflow with that tag.
 # This repository holds the workflow files and the releases; it holds no app code. The
 # source is read with a read-only deploy key (secret SOURCE_DEPLOY_KEY) from the
 # repository named in the secret SOURCE_REPO.
