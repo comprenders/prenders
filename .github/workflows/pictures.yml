@@ -235,6 +235,16 @@ jobs:
             adb shell input tap $xy
           }
 
+          # The forced stop of `fresh` gives a "Stopped by Android" dialog on the next start.
+          # Close it only when it shows, so that each picture shows its own scene.
+          close_stop() {
+            if adb shell uiautomator dump /sdcard/ui.xml > /dev/null 2>&1 && adb pull /sdcard/ui.xml "${RUNNER_TEMP}/ui.xml" > /dev/null 2>&1 \
+              && python3 "${RUNNER_TEMP}/find.py" "${RUNNER_TEMP}/ui.xml" text "Stopped by Android" > /dev/null 2>&1; then
+              tap text "OK"
+              sleep 1
+            fi
+          }
+
           s_first_run() {
             fresh
             adb shell am start -W -n "${PKG}/.LauncherActivity" > /dev/null
@@ -339,10 +349,8 @@ jobs:
             entry --es scene main --es computers unreachable,unreachable
             sleep 10
             shot 24-main-two-computers-page-failed
-            # The forced stop of the script can show the "Stopped by Android" dialog over the
-            # page. The picture above keeps it as evidence; close it before the next tap.
-            tap text "OK" || true
-            sleep 1
+            # The picture above keeps the stop dialog as evidence; close it before the next tap.
+            close_stop
             if ! tap text "Show another computer"; then
               tap prefix "desk-one "
             fi
@@ -355,6 +363,7 @@ jobs:
             fresh
             entry --es scene main --es computers unreachable "$@"
             sleep 4
+            close_stop
             shot "$name"
           }
           s_main_others() {
