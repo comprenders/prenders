@@ -21,11 +21,12 @@ on:
         default: master
         type: string
       target:
-        description: Which target to build
+        description: Which target to build ("all" builds every target)
         required: true
-        default: android
+        default: all
         type: choice
         options:
+          - all
           - android
           - aarch64-apple-darwin
           - x86_64-apple-darwin
@@ -43,6 +44,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
+      desktop: ${{ steps.sha.outputs.desktop }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,25 +60,35 @@ jobs:
         run: |
           set -euo pipefail
           sha=$(git rev-parse HEAD)
-          if [ "$TARGET" = "android" ] && ! git merge-base --is-ancestor "$sha" origin/master; then
+          if { [ "$TARGET" = "android" ] || [ "$TARGET" = "all" ]; } && ! git merge-base --is-ancestor "$sha" origin/master; then
             echo "build: the android target signs only commits on master; ${sha} is not on master." >&2
             exit 1
           fi
+          case "$TARGET" in
+            all) desktop='["aarch64-apple-darwin","x86_64-apple-darwin","x86_64-pc-windows-msvc"]' ;;
+            android) desktop='[]' ;;
+            *) desktop="[\"${TARGET}\"]" ;;
+          esac
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "desktop=${desktop}" >> "$GITHUB_OUTPUT"
           echo "build: source commit ${sha}"
 
   desktop:
-    name: build (${{ inputs.target }})
+    name: build (${{ matrix.target }})
     needs: resolve
-    if: ${{ !startsWith(inputs.target, 'android') }}
+    if: ${{ needs.resolve.outputs.desktop != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.resolve.outputs.desktop) }}
     runs-on: >-
-      ${{ fromJSON('{"aarch64-apple-darwin":"macos-15","x86_64-apple-darwin":"macos-15-intel","x86_64-pc-windows-msvc":"windows-latest"}')[inputs.target] }}
+      ${{ fromJSON('{"aarch64-apple-darwin":"macos-15","x86_64-apple-darwin":"macos-15-intel","x86_64-pc-windows-msvc":"windows-latest"}')[matrix.target] }}
     timeout-minutes: 90
     permissions:
       contents: write
     env:
       BUNDLES: >-
-        ${{ fromJSON('{"aarch64-apple-darwin":"dmg,app","x86_64-apple-darwin":"dmg,app","x86_64-pc-windows-msvc":"nsis,msi"}')[inputs.target] }}
+        ${{ fromJSON('{"aarch64-apple-darwin":"dmg,app","x86_64-apple-darwin":"dmg,app","x86_64-pc-windows-msvc":"nsis,msi"}')[matrix.target] }}
       SRC_SHA: ${{ needs.resolve.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
@@ -94,10 +106,10 @@ jobs:
         env:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
           CHATMAN_RELEASE_TAG: ""
-        run: bun run build:sidecar:${{ inputs.target }}
+        run: bun run build:sidecar:${{ matrix.target }}
       - name: The built server starts
         if: runner.os == 'macOS'
-        run: scripts/check-sidecar-starts.sh "src-tauri/binaries/chatman-${{ inputs.target }}"
+        run: scripts/check-sidecar-starts.sh "src-tauri/binaries/chatman-${{ matrix.target }}"
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -113,7 +125,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ inputs.target }}
+          targets: ${{ matrix.target }}
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -125,13 +137,13 @@ jobs:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
           CHATMAN_RELEASE_TAG: ""
         with:
-          args: --target ${{ inputs.target }} --bundles ${{ env.BUNDLES }}
+          args: --target ${{ matrix.target }} --bundles ${{ env.BUNDLES }}
       - name: Attach the installers to a draft prerelease
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TARGET: ${{ inputs.target }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           root="src-tauri/target/${TARGET}/release/bundle"
@@ -152,7 +164,7 @@ jobs:
   android-build:
     name: build (android)
     needs: resolve
-    if: ${{ inputs.target == 'android' }}
+    if: ${{ inputs.target == 'android' || inputs.target == 'all' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
