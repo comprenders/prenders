@@ -1,0 +1,78 @@
+name: release-start
+
+# Start the workflow `release` once for each new release tag of the source repository
+# (owner, 2026-10-09: "any tagged push to the private repo should lead to triggering the
+# release in the public repo").
+#
+# `scripts/release.sh` of the source makes and pushes the tag `v<version>` and starts no
+# run. This workflow runs on a schedule, reads the tags of the source with the read-only
+# deploy key (secret SOURCE_DEPLOY_KEY, repository in the secret SOURCE_REPO), and starts
+# `release.yml` of this repository for each tag that `scripts/release-tags-to-start.mjs`
+# of the source names: a tag v and a version, above the newest published release of this
+# repository, that has no run of `release.yml` yet. So one tag gives one run, also when
+# that run fails (a person starts a failed release again by hand), and an old tag that
+# never had a release starts nothing. An annotated tag with the message `draft` starts a
+# draft release, which publishes nothing.
+#
+# It needs no new secret: the token of the run reads the releases and the runs of this
+# repository and starts `release.yml` (a start by `workflow_dispatch` is allowed with
+# that token). The private repository runs nothing, because its Actions minutes are used
+# up.
+#
+# A schedule starts late when GitHub is busy, so a release can start some time after the
+# tag push. GitHub stops the schedule of a public repository after 60 days with no
+# activity in it; a push to this repository starts it again.
+#
+# No `push:`, no `pull_request:` and no `workflow_dispatch:`. Only the schedule starts a
+# run, on the default branch, so no other person can reach the secrets.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+# Two runs at the same time could each find no run for a tag and each start one.
+concurrency:
+  group: release-start
+  cancel-in-progress: false
+
+jobs:
+  start:
+    name: start
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The default branch of the source. `fetch-depth: 0` fetches every tag with its
+      # message.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Start release.yml for each new release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          releases=$(mktemp)
+          runs=$(mktemp)
+          gh api --paginate "repos/${REPO}/releases?per_page=100" --jq '.[] | select(.draft | not) | .tag_name' > "$releases"
+          gh api --paginate "repos/${REPO}/actions/workflows/release.yml/runs?per_page=100" --jq '.workflow_runs[].display_title' > "$runs"
+          start=$(node scripts/release-tags-to-start.mjs --releases "$releases" --runs "$runs")
+          if [ -z "$start" ]; then
+            echo "release-start: no new release tag"
+            exit 0
+          fi
+          while IFS=$'\t' read -r tag kind; do
+            args=(workflow run release.yml -R "$REPO" -f "tag=${tag}")
+            if [ "$kind" = draft ]; then
+              args+=(-f draft=true)
+            fi
+            echo "release-start: gh ${args[*]}"
+            gh "${args[@]}"
+          done <<< "$start"

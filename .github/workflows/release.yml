@@ -2,9 +2,9 @@ name: release
 
 # A release of the app. `scripts/release.sh [--draft] major|minor|patch` of the source
 # repository computes the next version from the last release tag (semantic versioning) and
-# pushes the tag `v<version>` there. The workflow `release-start.yml` of the source runs on
-# each pushed `v*` tag and starts this workflow with that tag, one run for each tag. A
-# person with write access can also start it by hand.
+# pushes the tag `v<version>` there. The scheduled workflow `release-start.yml` of this
+# repository reads the tags of the source and starts this workflow with each new tag, one
+# run for each tag. A person with write access can also start it by hand.
 #
 # No file of the source holds the version (plan-r3 7.1). `resolve` makes the build identity
 # of the tag (`scripts/build-identity.mjs --print`), and each job that builds or tests
@@ -30,7 +30,8 @@ name: release
 # (`cleanup.yml`).
 #
 # No `push:`, no `pull_request:` and no `schedule:`. Only a person with write access to
-# this repository can start a run, so no other person can reach the secrets.
+# this repository and the workflow `release-start.yml` of this repository can start a run,
+# so no other person can reach the secrets.
 
 on:
   workflow_dispatch:
