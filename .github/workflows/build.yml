@@ -12,7 +12,17 @@ name: build
 # draft has no git tag, and nothing is published. The name never starts with `v`.
 #
 # The source commit must have the `create`/`upload` form of `scripts/attach-dev-build.sh`
-# (2026-10-08). For an older commit, `resolve` fails at the create.
+# (2026-10-08) and `scripts/build-identity.mjs` (plan-r3 K2). For an older commit, `resolve`
+# fails.
+#
+# No file of the source holds the version (plan-r3 7.1). `resolve` makes the build identity
+# of the commit, a dev build after the last release tag (`scripts/build-identity.mjs
+# --print`). Each job that builds or tests writes it to `build-identity.json` of its
+# checkout (`--from`), which also checks that the checkout is the commit of the identity.
+#
+# With the target x86_64-pc-windows-msvc or all, the run also tests on Windows: the backend
+# suite (`backend-windows`) and the units of the shipped server (`smoke-windows`), the
+# same as the jobs of `release.yml`.
 #
 # The logs and the artifacts of each run are deleted after the run (`cleanup.yml`).
 #
@@ -55,6 +65,7 @@ jobs:
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
       desktop: ${{ steps.sha.outputs.desktop }}
+      identity: ${{ steps.identity.outputs.identity }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -82,6 +93,15 @@ jobs:
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "desktop=${desktop}" >> "$GITHUB_OUTPUT"
           echo "build: source commit ${sha}"
+      - name: Make the build identity of the commit
+        id: identity
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          identity=$(node scripts/build-identity.mjs --print --commit "$SHA")
+          echo "identity=${identity}" >> "$GITHUB_OUTPUT"
+          echo "build: the build identity is ${identity}"
       # The notes name the targets of this run. With android, they also give the install
       # lines of the APK with the certificate digest of `android/release-cert.sha256`: the
       # job `android-sign` refuses an APK whose certificate has another digest. The notes
@@ -92,6 +112,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TARGET: ${{ inputs.target }}
           SRC_SHA: ${{ steps.sha.outputs.sha }}
+          IDENTITY: ${{ steps.identity.outputs.identity }}
         run: |
           set -euo pipefail
           case "$TARGET" in
@@ -100,7 +121,7 @@ jobs:
           esac
           notes="Unreleased build of ${SRC_SHA}. Targets of the first run: ${targets}. Draft prerelease: no tag, nothing published."
           if [ "$TARGET" = "android" ] || [ "$TARGET" = "all" ]; then
-            version=$(jq -r .version src-tauri/tauri.conf.json)
+            version=$(jq -r .version <<< "$IDENTITY")
             digest=$(tr -d '[:space:]' < android/release-cert.sha256)
             apk_notes=$(bash scripts/android-release-notes.sh "cc-chatman_${version}_android.apk" "$digest")
             notes="${notes}"$'\n\n'"${apk_notes}"
@@ -131,6 +152,11 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
+      - name: Write the build identity of the commit
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@v2
       - name: Install backend dependencies
         working-directory: backend
@@ -164,6 +190,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      # `tauri.conf.json` has no version (plan-r3 7.1). The bundle takes the version of the
+      # identity through `--config`, so the file names and the installer carry it.
+      - name: Write the version of the bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version build-identity.json)
+          jq -n --arg v "$version" '{version: $v}' > "${RUNNER_TEMP}/tauri-version.json"
+          cat "${RUNNER_TEMP}/tauri-version.json"
       - name: Build Tauri bundle
         uses: tauri-apps/tauri-action@v0
         env:
@@ -171,7 +208,7 @@ jobs:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
           CHATMAN_RELEASE_TAG: ""
         with:
-          args: --target ${{ matrix.target }} --bundles ${{ env.BUNDLES }}
+          args: --target ${{ matrix.target }} --bundles ${{ env.BUNDLES }} --config ${{ runner.temp }}/tauri-version.json
       - name: Upload the installers into the draft prerelease of the commit
         shell: bash
         env:
@@ -190,6 +227,182 @@ jobs:
             exit 1
           fi
           GITHUB_SHA="$SRC_SHA" bash scripts/attach-dev-build.sh upload "${files[@]}"
+
+  # The backend suite on Windows, as the job `backend` of `release.yml` runs it on that leg.
+  backend-windows:
+    name: backend (windows-latest)
+    needs: resolve
+    if: ${{ inputs.target == 'x86_64-pc-windows-msvc' || inputs.target == 'all' }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - name: Write the build identity of the commit
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
+      - uses: oven-sh/setup-bun@v2
+      - name: Install backend dependencies
+        working-directory: backend
+        run: bun install --frozen-lockfile
+      - name: Type-check backend
+        working-directory: backend
+        run: bun run typecheck
+      - name: Test backend
+        working-directory: backend
+        run: bun run test
+
+  # The units of the shipped server on Windows. The steps are those of the job
+  # `smoke-windows` of `release.yml`; the reasons are in ci.yml of the source.
+  smoke-windows:
+    name: smoke-windows
+    needs: resolve
+    if: ${{ inputs.target == 'x86_64-pc-windows-msvc' || inputs.target == 'all' }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Resolve the smoke paths (outside the checkout)
+        id: paths
+        env:
+          EXPECTED_OUT: ${{ runner.temp }}\chatman-smoke-out
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrEmpty($env:RUNNER_TEMP)) { throw 'RUNNER_TEMP is empty' }
+          $root     = Join-Path $env:RUNNER_TEMP 'chatman-smoke'
+          $out      = Join-Path $env:RUNNER_TEMP 'chatman-smoke-out'
+          $manifest = Join-Path $out 'fixture-manifest.json'
+          if ($out -cne $env:EXPECTED_OUT) {
+            throw "smoke output dir '$out' disagrees with the artefact-upload path '$($env:EXPECTED_OUT)'"
+          }
+          $enc = New-Object System.Text.UTF8Encoding($false)
+          $lines = "SMOKE_ROOT=$root`r`nSMOKE_OUT=$out`r`nSMOKE_MANIFEST=$manifest`r`n"
+          [IO.File]::AppendAllText($env:GITHUB_ENV, $lines, $enc)
+          Write-Host $lines
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - name: Write the build identity of the commit
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install backend dependencies
+        id: deps
+        working-directory: backend
+        run: bun install --frozen-lockfile
+
+      - name: Unit 0 - static-check the smoke scripts (parse + unassigned reads)
+        id: lint
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        env:
+          SMOKE_UNIT: '0'
+        run: .\.github\smoke-windows\check-scripts.ps1
+
+      - name: Unit 2 - build the Windows sidecar and check its exact path
+        id: build
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          SMOKE_UNIT: '2'
+        run: .\.github\smoke-windows\assert-sidecar-build.ps1 -RepoRoot "${{ github.workspace }}"
+
+      - name: Unit 3 - lay the hostile fixture (long path, junction, cycle, credential)
+        id: fixture
+        if: ${{ !cancelled() && steps.paths.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          SMOKE_UNIT: '3'
+        run: >-
+          .\.github\smoke-windows\lay-fixture.ps1
+          -Root "$env:SMOKE_ROOT" -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST"
+
+      - name: Unit 3 + 4b - run the shipped .exe against the fixture
+        id: api
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.fixture.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          SMOKE_UNIT: 3b
+        run: >-
+          .\.github\smoke-windows\assert-api.ps1
+          -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST" -LogDir "$env:SMOKE_OUT"
+
+      # The timeout of this step must stay equal to the one of the same step in ci.yml of
+      # the source:
+      # `assert-launcher.ps1` checks its own worst case against it.
+      - name: Unit 4a - launch through real PowerShell and check the argv it delivered
+        id: launcher
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          SMOKE_UNIT: 4a
+        run: >-
+          .\.github\smoke-windows\assert-launcher.ps1
+          -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST" -LogDir "$env:SMOKE_OUT"
+
+      - name: Unit 5 - execute the keep-awake payload and check the orphan guard
+        id: keepawake
+        if: ${{ !cancelled() && steps.paths.outcome == 'success' && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          SMOKE_UNIT: '5'
+        run: >-
+          .\.github\smoke-windows\assert-keepawake.ps1
+          -RepoRoot "${{ github.workspace }}" -LogDir "$env:SMOKE_OUT"
+
+      - name: Unit 6 - the errno Windows gives for an unreadable root and a symlink cycle
+        id: errno
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' && steps.deps.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          SMOKE_UNIT: '6'
+        run: >-
+          .\.github\smoke-windows\assert-root-errno.ps1
+          -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST" -LogDir "$env:SMOKE_OUT"
+
+      # One day, not the 30 of ci.yml: the artifacts of a successful run are deleted by
+      # `cleanup.yml`, and a failed run is read the same day.
+      - name: Upload smoke artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-windows-artefacts
+          path: ${{ runner.temp }}\chatman-smoke-out
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Every unit that ran contributed a ledger
+        if: always()
+        timeout-minutes: 5
+        env:
+          UNIT_OUTCOMES: >-
+            {"0":"${{ steps.lint.outcome }}",
+            "2":"${{ steps.build.outcome }}",
+            "3":"${{ steps.fixture.outcome }}",
+            "3b":"${{ steps.api.outcome }}",
+            "4a":"${{ steps.launcher.outcome }}",
+            "5":"${{ steps.keepawake.outcome }}",
+            "6":"${{ steps.errno.outcome }}"}
+        run: >-
+          .\.github\smoke-windows\assert-units-reported.ps1
+          -LogDir "$env:SMOKE_OUT" -Outcomes "$env:UNIT_OUTCOMES"
+
 
   # Gradle runs here, so this job has no secret except the read-only source key, and only
   # `contents: read`.
@@ -211,6 +424,11 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
+      - name: Write the build identity of the commit
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -233,7 +451,7 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          version=$(jq -r .version src-tauri/tauri.conf.json)
+          version=$(jq -r .version build-identity.json)
           bash scripts/check-apk-badging.sh android/app/build/outputs/apk/release/app-release-unsigned.apk "$version"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4

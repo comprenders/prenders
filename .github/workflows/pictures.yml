@@ -49,7 +49,12 @@ jobs:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ inputs.ref }}
+          # Every commit and tag: the version comes from the last release tag (plan-r3 7.1).
+          fetch-depth: 0
           persist-credentials: false
+      # Gradle reads `build-identity.json`, and no file of the source holds the version.
+      - name: Write the build identity of the commit
+        run: node scripts/build-identity.mjs --write
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

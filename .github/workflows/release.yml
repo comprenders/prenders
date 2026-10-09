@@ -1,9 +1,15 @@
 name: release
 
-# A release of the app, by hand only. `scripts/release.sh [--draft] major|minor|patch` of
-# the source repository computes the next version from the last release tag (semantic
-# versioning), commits it, pushes master, pushes the tag `v<version>` there and starts this
-# workflow with that tag.
+# A release of the app. `scripts/release.sh [--draft] major|minor|patch` of the source
+# repository computes the next version from the last release tag (semantic versioning) and
+# pushes the tag `v<version>` there. The workflow `release-start.yml` of the source runs on
+# each pushed `v*` tag and starts this workflow with that tag, one run for each tag. A
+# person with write access can also start it by hand.
+#
+# No file of the source holds the version (plan-r3 7.1). `resolve` makes the build identity
+# of the tag (`scripts/build-identity.mjs --print`), and each job that builds or tests
+# writes it to `build-identity.json` of its checkout (`--from`), which also checks that the
+# checkout is the commit of the identity.
 # This repository holds the workflow files and the releases; it holds no app code. The
 # source is read with a read-only deploy key (secret SOURCE_DEPLOY_KEY) from the
 # repository named in the secret SOURCE_REPO.
@@ -59,6 +65,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
+      identity: ${{ steps.identity.outputs.identity }}
     steps:
       - name: Refuse a tag that is not v and a version
         env:
@@ -93,6 +100,26 @@ jobs:
           fi
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "release: ${TAG} is the source commit ${sha}"
+      # The scripts and the tests of the tag commit, not of master.
+      - name: Switch to the tag commit
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: git switch --quiet --detach "$SHA"
+      # The tag is in the grammar, points at the commit and is higher than every other
+      # release tag that the commit reaches; else the script names the fault and stops.
+      - name: Make the build identity of the tag
+        id: identity
+        env:
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          identity=$(node scripts/build-identity.mjs --print --commit "$SHA" --tag "$TAG")
+          echo "identity=${identity}" >> "$GITHUB_OUTPUT"
+          echo "release: the build identity is ${identity}"
+      # No tracked file holds the number of the tag, and the script works (plan-r3 7.1).
+      - name: Test the build identity and that no file holds the version
+        run: node --test scripts/tests/*.test.mjs
 
   # The private ci.yml lints its own workflow files. Here the release path is the files
   # of THIS repository, so this job lints them: a malformed expression, an unknown
@@ -136,26 +163,6 @@ jobs:
           "${RUNNER_TEMP}/actionlint" -color \
             -shellcheck="${RUNNER_TEMP}/shellcheck" -pyflakes=
 
-  versions:
-    name: versions
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ secrets.SOURCE_REPO }}
-          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
-          ref: ${{ needs.resolve.outputs.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Versions agree with each other and with the tag
-        env:
-          TAG: ${{ inputs.tag }}
-        run: node scripts/check-versions.mjs --tag "$TAG"
-
   backend:
     name: backend (${{ matrix.os }})
     needs: resolve
@@ -172,6 +179,11 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
+      - name: Write the build identity of the tag
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@v2
       - name: Install backend dependencies
         working-directory: backend
@@ -217,6 +229,11 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
+      - name: Write the build identity of the tag
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v4
         with:
@@ -333,6 +350,11 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
+      - name: Write the build identity of the tag
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -413,6 +435,11 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
+      - name: Write the build identity of the tag
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@v2
       - name: Install backend dependencies
         working-directory: backend
@@ -450,6 +477,15 @@ jobs:
           workspaces: src-tauri
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      # `tauri.conf.json` has no version (plan-r3 7.1). The bundle takes the version of the
+      # identity through `--config`, so the file names and the installer carry it.
+      - name: Write the version of the bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version build-identity.json)
+          jq -n --arg v "$version" '{version: $v}' > "${RUNNER_TEMP}/tauri-version.json"
+          cat "${RUNNER_TEMP}/tauri-version.json"
       - name: Build Tauri bundle
         uses: tauri-apps/tauri-action@v0
         env:
@@ -457,7 +493,7 @@ jobs:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
           CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
         with:
-          args: --target ${{ matrix.triple }} --bundles ${{ matrix.bundles }}
+          args: --target ${{ matrix.triple }} --bundles ${{ matrix.bundles }} --config ${{ runner.temp }}/tauri-version.json
       # The same string that the upload expands, so a changed bundle layout fails here
       # with a sentence, and not as an empty release.
       - name: Refuse unless the upload glob matches something
@@ -514,6 +550,11 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
+      - name: Write the build identity of the tag
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -538,7 +579,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/check-apk-badging.sh android/app/build/outputs/apk/release/app-release-unsigned.apk \
-            "$(jq -r .version src-tauri/tauri.conf.json)"
+            "$(jq -r .version build-identity.json)"
       - uses: actions/upload-artifact@v4
         with:
           name: android-unsigned
@@ -604,7 +645,7 @@ jobs:
   # failed job does not skip this job; the first step names it and refuses.
   publish:
     name: publish
-    needs: [resolve, actionlint, versions, backend, smoke-windows, frontend, python, bundle, android, android-sign]
+    needs: [resolve, actionlint, backend, smoke-windows, frontend, python, bundle, android, android-sign]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
