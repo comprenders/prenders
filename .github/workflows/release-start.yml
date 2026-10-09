@@ -47,7 +47,7 @@ jobs:
     steps:
       # The default branch of the source. `fetch-depth: 0` fetches every tag with its
       # message.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}

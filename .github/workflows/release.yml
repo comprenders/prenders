@@ -79,7 +79,7 @@ jobs:
           fi
       # No `ref:`, so the default branch of the source. `fetch-depth: 0` fetches every
       # branch and every tag, so the tag and origin/master are both here.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
@@ -136,7 +136,7 @@ jobs:
       SHELLCHECK_VERSION: 0.11.0
       SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Install actionlint
@@ -158,6 +158,19 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}" --strip-components=1 \
             "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
           "${RUNNER_TEMP}/shellcheck" --version
+      # Build review A1: this run holds the signing secrets and the write token, so every
+      # action of every workflow of this repository is named by a commit hash, which cannot
+      # move. A tag such as `@v4` can move. The comment after the hash names the tag.
+      - name: Every action is pinned by a commit hash
+        run: |
+          set -euo pipefail
+          unpinned=$(grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:' .github/workflows/*.yml \
+            | grep -vE 'uses:[[:space:]]*[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$)' || true)
+          if [ -n "$unpinned" ]; then
+            echo "These uses: lines name an action by a tag and not by a commit hash:" >&2
+            echo "$unpinned" >&2
+            exit 1
+          fi
       - name: Lint every workflow file
         run: |
           set -euo pipefail
@@ -174,7 +187,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
@@ -185,7 +198,7 @@ jobs:
         env:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -224,7 +237,7 @@ jobs:
           $lines = "SMOKE_ROOT=$root`r`nSMOKE_OUT=$out`r`nSMOKE_MANIFEST=$manifest`r`n"
           [IO.File]::AppendAllText($env:GITHUB_ENV, $lines, $enc)
           Write-Host $lines
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
@@ -235,8 +248,8 @@ jobs:
         env:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
       - name: Install backend dependencies
@@ -316,7 +329,7 @@ jobs:
       # `cleanup.yml`, and a failed run is read the same day.
       - name: Upload smoke artefacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: smoke-windows-artefacts
           path: ${{ runner.temp }}\chatman-smoke-out
@@ -345,7 +358,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
@@ -356,7 +369,7 @@ jobs:
         env:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
@@ -384,13 +397,13 @@ jobs:
       matrix:
         python-version: ['3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
       # The `tray` extra pulls rumps, which is macOS-only, so it is not installed here.
@@ -430,7 +443,7 @@ jobs:
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
@@ -441,7 +454,7 @@ jobs:
         env:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -454,7 +467,7 @@ jobs:
       - name: The built server starts
         if: runner.os == 'macOS'
         run: scripts/check-sidecar-starts.sh "src-tauri/binaries/chatman-${{ matrix.triple }}"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
@@ -469,11 +482,14 @@ jobs:
           CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
         run: npm run build
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
+          # With a commit hash in `uses:` the action cannot take the toolchain from the
+          # ref name, so the floating `stable` is named here (plan-r3 L1001).
+          toolchain: stable
           targets: ${{ matrix.triple }}
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
       - name: Test Rust
@@ -488,7 +504,7 @@ jobs:
           jq -n --arg v "$version" '{version: $v}' > "${RUNNER_TEMP}/tauri-version.json"
           cat "${RUNNER_TEMP}/tauri-version.json"
       - name: Build Tauri bundle
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
@@ -524,7 +540,7 @@ jobs:
             exit 1
           fi
           echo "bundle: ${total} file(s) match the upload glob for ${TRIPLE}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bundle-${{ matrix.triple }}
           path: ${{ matrix.artifact_glob }}
@@ -545,7 +561,7 @@ jobs:
       ANDROID_BUILD_TOOLS_VERSION: 36.0.0
       ANDROID_PLATFORM: android-36
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
@@ -556,14 +572,14 @@ jobs:
         env:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
         with:
           distribution: temurin
           java-version: '17'
       # Plan-r3 2.2 item 1 (K4): the APK holds the phone page of the web build of this commit.
       # Gradle task `copyPhonePage` copies it from `manager/web/dist` and stops when the
       # identity of that build is not the identity of the APK.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
@@ -577,7 +593,7 @@ jobs:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
           CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
         run: npm run build
-      - uses: gradle/actions/setup-gradle@v5
+      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
         with:
           gradle-version: 9.6.1
       - name: Require the SDK packages
@@ -598,7 +614,7 @@ jobs:
           set -euo pipefail
           bash scripts/check-apk-badging.sh android/app/build/outputs/apk/release/app-release-unsigned.apk \
             "$(jq -r .version build-identity.json)"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android-unsigned
           path: android/app/build/outputs/apk/release/app-release-unsigned.apk
@@ -619,7 +635,7 @@ jobs:
     env:
       ANDROID_BUILD_TOOLS_VERSION: 36.0.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
@@ -629,7 +645,7 @@ jobs:
             android/release-cert.sha256
             scripts/sign-apk.sh
           sparse-checkout-cone-mode: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: android-unsigned
           path: ${{ runner.temp }}/android-unsigned
@@ -652,7 +668,7 @@ jobs:
             | tee "${RUNNER_TEMP}/sign.log"
           digest=$(tail -n 1 "${RUNNER_TEMP}/sign.log")
           echo "cert_sha256=${digest}" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bundle-android
           path: ${{ runner.temp }}/signed/*.apk
@@ -680,7 +696,7 @@ jobs:
       # The scripts of the release steps, from the source. When `resolve` failed, its
       # output is empty and this is the default branch of the source; the next step
       # then refuses, because `resolve` did not succeed.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
@@ -697,7 +713,7 @@ jobs:
         run: bash scripts/publish-release.sh needs "$TAG"
       # `pattern` + `merge-multiple`: the smoke artefacts must not go into the release.
       - name: Download the bundle artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: bundle-*
           merge-multiple: true
