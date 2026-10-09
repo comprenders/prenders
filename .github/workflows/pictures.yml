@@ -354,6 +354,8 @@ jobs:
             fresh
             entry --es scene settings --es computers connected
             sleep 3
+            open_computers
+            sleep 2
             tap text "Remove from this app"
             sleep 1
             shot 21-settings-remove-dialog
@@ -391,14 +393,19 @@ jobs:
             close_stop
             shot "$name"
           }
-          # Plan-r3 K5: "Add a computer" and "Pair again" are buttons of the Computers route of the
-          # page. App settings opens it through its row "Computers", which ends in the count "1 ›".
+          # Plan-r3 K5: "Add a computer", "Pair again" and "Remove from this app" are buttons of the
+          # Computers route of the page. App settings opens it through its row "Computers", which
+          # ends in the count "1 ›". The WebView can give the row as one node with the whole text
+          # "Computers 1 ›", or the count as a node of its own, so the tap tries both.
+          open_computers() {
+            tap prefix "Computers " || tap text "1 ›"
+          }
           settings_tap_shot() {
             local name=$1 word=$2
             fresh
             entry --es scene settings --es computers connected
             sleep 3
-            tap text "1 ›"
+            open_computers
             sleep 2
             tap text "$word"
             sleep 2
