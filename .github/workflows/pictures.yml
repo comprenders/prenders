@@ -303,8 +303,11 @@ jobs:
           }
           s_type_name() {
             fresh
-            entry --es scene main --es open type_address
-            sleep 3
+            # Plan-r3 K5: the pair screens are routes of the page; the link of the pair start opens the name form.
+            entry --es scene main
+            sleep 4
+            tap text "I cannot scan the code"
+            sleep 2
             shot 08-type-name-empty
             tap edit 0
             adb shell input text bad-name
@@ -388,9 +391,22 @@ jobs:
             close_stop
             shot "$name"
           }
+          # Plan-r3 K5: "Add a computer" and "Pair again" are buttons of the Computers route of the
+          # page. App settings opens it through its row "Computers", which ends in the count "1 ›".
+          settings_tap_shot() {
+            local name=$1 word=$2
+            fresh
+            entry --es scene settings --es computers connected
+            sleep 3
+            tap text "1 ›"
+            sleep 2
+            tap text "$word"
+            sleep 2
+            shot "$name"
+          }
           s_main_others() {
-            s_main_open 26-add-computer --es open add_computer
-            s_main_open 27-pair-again --es open pair_again
+            settings_tap_shot 26-add-computer "Add a computer"
+            settings_tap_shot 27-pair-again "Pair again"
             s_main_open 28-tap-of-removed-computer-dialog --es open tap_removed
             s_main_open 29-crash-dialog --ez crash true
           }
