@@ -44,14 +44,33 @@ jobs:
       SYSTEM_IMAGE: system-images;android-35;google_apis;x86_64
       PKG: com.ccchatman.phone
     steps:
+      # The checkout takes the default branch with every commit and tag, and the next step
+      # moves to the commit of `ref`. The checkout action takes only a branch, a tag or a full
+      # commit id as `ref`; the step also takes a short commit id (backlog line 101).
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
-          ref: ${{ inputs.ref }}
           # Every commit and tag: the version comes from the last release tag (plan-r3 7.1).
           fetch-depth: 0
           persist-credentials: false
+      - name: Move to the commit of the input ref
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          # A branch name is a remote branch after the checkout. A tag, a full commit id and a
+          # short commit id resolve as they are. An unknown or an ambiguous ref stops the run.
+          if sha=$(git rev-parse --verify --quiet "refs/remotes/origin/${REF}^{commit}"); then
+            :
+          elif sha=$(git rev-parse --verify --quiet "${REF}^{commit}"); then
+            :
+          else
+            echo "pictures: the ref ${REF} is not a branch, a tag or a commit of the source repository." >&2
+            exit 1
+          fi
+          git checkout --quiet --detach "$sha"
+          echo "pictures: source commit ${sha}"
       # Gradle reads `build-identity.json`, and no file of the source holds the version.
       - name: Write the build identity of the commit
         run: node scripts/build-identity.mjs --write
