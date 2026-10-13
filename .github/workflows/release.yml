@@ -431,17 +431,25 @@ jobs:
           - os: macos-15
             triple: aarch64-apple-darwin
             bundles: dmg,app
-            artifact_glob: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            artifact_glob: |-
+              src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
           - os: macos-15-intel
             triple: x86_64-apple-darwin
             bundles: dmg,app
-            artifact_glob: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+            artifact_glob: |-
+              src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
             bundles: nsis,msi
             artifact_glob: |-
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi.sig
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -496,21 +504,63 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
       # `tauri.conf.json` has no version (plan-r3 7.1). The bundle takes the version of the
       # identity through `--config`, so the file names and the installer carry it.
+      # The update from inside the app: only this file sets `createUpdaterArtifacts` and the
+      # endpoint of `latest.json`, so a dev build and a run from the source make no update
+      # file and have no endpoint. The endpoint is the newest published release of THIS
+      # repository, because the releases are here.
       - name: Write the version of the bundle
         shell: bash
+        env:
+          RELEASE_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           version=$(jq -r .version build-identity.json)
-          jq -n --arg v "$version" '{version: $v}' > "${RUNNER_TEMP}/tauri-version.json"
+          endpoint="https://github.com/${RELEASE_REPO}/releases/latest/download/latest.json"
+          jq -n --arg v "$version" --arg endpoint "$endpoint" \
+            '{version: $v, bundle: {createUpdaterArtifacts: true}, plugins: {updater: {endpoints: [$endpoint]}}}' \
+            > "${RUNNER_TEMP}/tauri-version.json"
           cat "${RUNNER_TEMP}/tauri-version.json"
+      # The two signing secrets sign the update files. The CLI reads them only when
+      # `createUpdaterArtifacts` is set, which only the version file above does.
       - name: Build Tauri bundle
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
           CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           args: --target ${{ matrix.triple }} --bundles ${{ matrix.bundles }} --config ${{ runner.temp }}/tauri-version.json
+      # The bundler gives the macOS update archive the same name on both triples, and
+      # `publish` merges all artifacts into one folder, so one file would overwrite the
+      # other. The new name has the version and the architecture and no space. A rename
+      # does not change the signature, which is over the content.
+      - name: Give the macOS update archive the name of its architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          version=$(jq -r .version build-identity.json)
+          case "$TRIPLE" in
+            aarch64-apple-darwin) arch=aarch64 ;;
+            x86_64-apple-darwin) arch=x64 ;;
+            *) echo "bundle: no macOS architecture name for ${TRIPLE}" >&2; exit 1 ;;
+          esac
+          dir="src-tauri/target/${TRIPLE}/release/bundle/macos"
+          archives=("$dir"/*.app.tar.gz)
+          if [ "${#archives[@]}" -ne 1 ] || [ ! -f "${archives[0]}.sig" ]; then
+            echo "bundle: ${dir} must hold exactly one .app.tar.gz with its .sig; found ${#archives[@]} archive(s)" >&2
+            ls -la "$dir" >&2 || true
+            exit 1
+          fi
+          target="${dir}/CC.Chatman_${version}_${arch}.app.tar.gz"
+          mv "${archives[0]}" "$target"
+          mv "${archives[0]}.sig" "${target}.sig"
+          echo "bundle: ${target} and its .sig"
       # The same string that the upload expands, so a changed bundle layout fails here
       # with a sentence, and not as an empty release.
       - name: Refuse unless the upload glob matches something
@@ -706,6 +756,7 @@ jobs:
             scripts/check-release-set.sh
             scripts/android-release-notes.sh
             scripts/publish-release.sh
+            scripts/updater-manifest.mjs
           sparse-checkout-cone-mode: false
       - name: Refuse if any job did not succeed
         env:
@@ -718,6 +769,10 @@ jobs:
           pattern: bundle-*
           merge-multiple: true
           path: dist
+      # Before the list, so that `files.txt` names `dist/latest.json` and the upload sends
+      # it. The script reads the folder; the Node of the runner image runs it.
+      - name: Write latest.json
+        run: node scripts/updater-manifest.mjs write dist "$TAG" "$GH_REPO"
       - name: List the downloaded files
         run: |
           set -euo pipefail
@@ -731,4 +786,4 @@ jobs:
       - name: Upload the bundles
         run: bash scripts/publish-release.sh upload "$TAG" "${RUNNER_TEMP}/files.txt"
       - name: Verify the release carries the complete set
-        run: bash scripts/publish-release.sh verify "$MODE" "$TAG"
+        run: bash scripts/publish-release.sh verify "$MODE" "$TAG" dist/latest.json
