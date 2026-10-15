@@ -475,6 +475,12 @@ jobs:
       - name: The built server starts
         if: runner.os == 'macOS'
         run: scripts/check-sidecar-starts.sh "src-tauri/binaries/chatman-${{ matrix.triple }}"
+      # The keeper (the process that holds a kept run) must start, read its hello, start
+      # a child, move one line and end, on each leg, the Windows leg too. Its child is the
+      # script itself in an echo mode, run by the Bun of this job. The same step is in ci.yml.
+      - name: The built keeper starts
+        shell: bash
+        run: bun scripts/check-keeper-starts.ts "src-tauri/binaries/chatman-keeper-${{ matrix.triple }}${{ runner.os == 'Windows' && '.exe' || '' }}"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
