@@ -199,6 +199,10 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
+        # of the app repository, and as ci.yml there.
+        with:
+          bun-version: "1.4.0"
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -249,6 +253,10 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
+        # of the app repository, and as ci.yml there.
+        with:
+          bun-version: "1.4.0"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
@@ -464,6 +472,10 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
+        # of the app repository, and as ci.yml there.
+        with:
+          bun-version: "1.4.0"
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -564,7 +576,7 @@ jobs:
             ls -la "$dir" >&2 || true
             exit 1
           fi
-          target="${dir}/CC.Chatman_${version}_${arch}.app.tar.gz"
+          target="${dir}/Prenders_${version}_${arch}.app.tar.gz"
           mv "${archives[0]}" "$target"
           mv "${archives[0]}.sig" "${target}.sig"
           echo "bundle: ${target} and its .sig"
@@ -720,7 +732,7 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           mkdir -p "${RUNNER_TEMP}/signed"
-          signed="${RUNNER_TEMP}/signed/cc-chatman_${version}_android.apk"
+          signed="${RUNNER_TEMP}/signed/prenders_${version}_android.apk"
           bash scripts/sign-apk.sh "${RUNNER_TEMP}/android-unsigned/app-release-unsigned.apk" "$signed" \
             | tee "${RUNNER_TEMP}/sign.log"
           digest=$(tail -n 1 "${RUNNER_TEMP}/sign.log")

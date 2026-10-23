@@ -123,7 +123,7 @@ jobs:
           if [ "$TARGET" = "android" ] || [ "$TARGET" = "all" ]; then
             version=$(jq -r .version <<< "$IDENTITY")
             digest=$(tr -d '[:space:]' < android/release-cert.sha256)
-            apk_notes=$(bash scripts/android-release-notes.sh "cc-chatman_${version}_android.apk" "$digest")
+            apk_notes=$(bash scripts/android-release-notes.sh "prenders_${version}_android.apk" "$digest")
             notes="${notes}"$'\n\n'"${apk_notes}"
           fi
           GITHUB_SHA="$SRC_SHA" bash scripts/attach-dev-build.sh create "$notes"
@@ -158,6 +158,10 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
+        # of the app repository, and as ci.yml there.
+        with:
+          bun-version: "1.4.0"
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -251,6 +255,10 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
+        # of the app repository, and as ci.yml there.
+        with:
+          bun-version: "1.4.0"
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -302,6 +310,10 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
+        # of the app repository, and as ci.yml there.
+        with:
+          bun-version: "1.4.0"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
@@ -519,7 +531,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/signed"
-          signed="${RUNNER_TEMP}/signed/cc-chatman_${VERSION}_android.apk"
+          signed="${RUNNER_TEMP}/signed/prenders_${VERSION}_android.apk"
           bash scripts/sign-apk.sh "${RUNNER_TEMP}/android-unsigned/app-release-unsigned.apk" "$signed" \
             > "${RUNNER_TEMP}/sign.log"
           digest=$(tail -n 1 "${RUNNER_TEMP}/sign.log")
