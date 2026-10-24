@@ -479,6 +479,12 @@ jobs:
           done
       - name: Test the Android app and build the unsigned release APK
         run: gradle -p android --quiet testDebugUnitTest assembleRelease
+      # Next-batch plan, N9: `cleanup.yml` deletes the log of a green run, so the count of
+      # the JVM tests goes to the job summary. No result file, or no test, fails the job.
+      - name: Count the Android JVM tests
+        run: |
+          set -euo pipefail
+          node scripts/junit-count.mjs | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Check the package line of the APK
         id: version
         run: |

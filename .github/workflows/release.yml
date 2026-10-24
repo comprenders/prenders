@@ -432,6 +432,10 @@ jobs:
     name: bundle (${{ matrix.triple }})
     needs: resolve
     runs-on: ${{ matrix.os }}
+    # Next-batch plan, N11: the GitHub environment `release-signing` holds the seven Apple
+    # secrets. Only the macOS legs get it; the Windows leg has an empty name, so no
+    # environment and no Apple secret.
+    environment: ${{ matrix.environment }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -440,6 +444,7 @@ jobs:
           - os: macos-15
             triple: aarch64-apple-darwin
             bundles: dmg,app
+            environment: release-signing
             artifact_glob: |-
               src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
               src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
@@ -447,6 +452,7 @@ jobs:
           - os: macos-15-intel
             triple: x86_64-apple-darwin
             bundles: dmg,app
+            environment: release-signing
             artifact_glob: |-
               src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
               src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz
@@ -454,6 +460,7 @@ jobs:
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
             bundles: nsis,msi
+            environment: ""
             artifact_glob: |-
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
@@ -479,6 +486,31 @@ jobs:
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
+      # Next-batch plan, N11, item 2: a release run has no unsigned macOS path. The script
+      # names each empty secret and prints no value.
+      - name: Refuse unless the macOS signing secrets are set
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: bash scripts/check-signing-env.sh macos
+      # Next-batch plan, N11, item 3: its own step, so the file is there when tauri-action
+      # reads it. The step "Remove the notarisation key" deletes it with `if: always()`.
+      - name: Write the notarisation key
+        if: runner.os == 'macOS'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          key="${RUNNER_TEMP}/notarisation-key.p8"
+          umask 077
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          echo "APPLE_API_KEY_PATH=${key}" >> "$GITHUB_ENV"
       - name: Build backend sidecar
         working-directory: backend
         env:
@@ -527,17 +559,31 @@ jobs:
       # endpoint of `latest.json`, so a dev build and a run from the source make no update
       # file and have no endpoint. The endpoint is the newest published release of THIS
       # repository, because the releases are here.
+      # Next-batch plan, N11, item 4: on macOS the file also sets the Developer ID identity,
+      # so the release does not depend on the order of the env value and the "-" of
+      # `tauri.conf.json`.
       - name: Write the version of the bundle
         shell: bash
         env:
           RELEASE_REPO: ${{ github.repository }}
+          SIGNING_IDENTITY: ${{ runner.os == 'macOS' && secrets.APPLE_SIGNING_IDENTITY || '' }}
         run: |
           set -euo pipefail
           version=$(jq -r .version build-identity.json)
           endpoint="https://github.com/${RELEASE_REPO}/releases/latest/download/latest.json"
-          jq -n --arg v "$version" --arg endpoint "$endpoint" \
-            '{version: $v, bundle: {createUpdaterArtifacts: true}, plugins: {updater: {endpoints: [$endpoint]}}}' \
-            > "${RUNNER_TEMP}/tauri-version.json"
+          if [ "$RUNNER_OS" = macOS ]; then
+            if [ -z "$SIGNING_IDENTITY" ]; then
+              echo "bundle: the secret APPLE_SIGNING_IDENTITY is empty, so the macOS bundle cannot be signed." >&2
+              exit 1
+            fi
+            jq -n --arg v "$version" --arg endpoint "$endpoint" --arg identity "$SIGNING_IDENTITY" \
+              '{version: $v, bundle: {createUpdaterArtifacts: true, macOS: {signingIdentity: $identity}}, plugins: {updater: {endpoints: [$endpoint]}}}' \
+              > "${RUNNER_TEMP}/tauri-version.json"
+          else
+            jq -n --arg v "$version" --arg endpoint "$endpoint" \
+              '{version: $v, bundle: {createUpdaterArtifacts: true}, plugins: {updater: {endpoints: [$endpoint]}}}' \
+              > "${RUNNER_TEMP}/tauri-version.json"
+          fi
           cat "${RUNNER_TEMP}/tauri-version.json"
       # The two signing secrets sign the update files. The CLI reads them only when
       # `createUpdaterArtifacts` is set, which only the version file above does.
@@ -549,8 +595,36 @@ jobs:
           CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Next-batch plan, N11, item 5: Tauri signs, notarises and staples the `.app` on
+          # the macOS legs. APPLE_API_KEY_PATH comes from the step "Write the notarisation
+          # key". The Windows leg has no environment, so these values are empty there.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           args: --target ${{ matrix.triple }} --bundles ${{ matrix.bundles }} --config ${{ runner.temp }}/tauri-version.json
+      # Next-batch plan, N11, item 7: the signature of the `.app` (Developer ID of the
+      # team, notarisation ticket, Gatekeeper), and the SIGNED Bun binaries inside it start
+      # under the hardened runtime (a Bun binary without the JIT entitlement stops).
+      - name: Verify the signature of the macOS app
+        if: runner.os == 'macOS'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TRIPLE: ${{ matrix.triple }}
+        run: bash scripts/verify-macos-signature.sh "src-tauri/target/${TRIPLE}/release/bundle/macos/Prenders.app" "$APPLE_TEAM_ID"
+      - name: The signed server inside the app starts
+        if: runner.os == 'macOS'
+        run: scripts/check-sidecar-starts.sh "src-tauri/target/${{ matrix.triple }}/release/bundle/macos/Prenders.app/Contents/MacOS/chatman"
+      - name: The signed keeper inside the app starts
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bun scripts/check-keeper-starts.ts "src-tauri/target/${{ matrix.triple }}/release/bundle/macos/Prenders.app/Contents/MacOS/chatman-keeper"
+      - name: Remove the notarisation key
+        if: always() && runner.os == 'macOS'
+        run: rm -f "${RUNNER_TEMP}/notarisation-key.p8"
       # The bundler gives the macOS update archive the same name on both triples, and
       # `publish` merges all artifacts into one folder, so one file would overwrite the
       # other. The new name has the version and the architecture and no space. A rename
@@ -626,6 +700,9 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    # Next-batch plan, N9: the count line of the JVM tests, for the release notes.
+    outputs:
+      jvm_tests: ${{ steps.jvm.outputs.jvm_tests }}
     env:
       ANDROID_BUILD_TOOLS_VERSION: 36.0.0
       ANDROID_PLATFORM: android-36
@@ -676,6 +753,16 @@ jobs:
           done
       - name: Test the Android app
         run: gradle -p android testDebugUnitTest
+      # Next-batch plan, N9: `cleanup.yml` deletes the log of a green run, so the count goes
+      # to the job summary and, through the job output, to the release notes. No result
+      # file, or no test, fails the job.
+      - name: Count the Android JVM tests
+        id: jvm
+        run: |
+          set -euo pipefail
+          line=$(node scripts/junit-count.mjs)
+          printf '%s\n' "$line" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'jvm_tests=%s\n' "$line" >> "$GITHUB_OUTPUT"
       - name: Build the unsigned release APK
         run: gradle -p android assembleRelease
       - name: Check the package line of the APK
@@ -761,6 +848,8 @@ jobs:
       MODE: ${{ inputs.draft && 'draft' || 'release' }}
       SRC_SHA: ${{ needs.resolve.outputs.sha }}
       CERT_SHA256: ${{ needs.android-sign.outputs.cert_sha256 }}
+      # Next-batch plan, N9: the count line of the JVM tests that `android` printed.
+      JVM_TESTS: ${{ needs.android.outputs.jvm_tests }}
     steps:
       # The scripts of the release steps, from the source. When `resolve` failed, its
       # output is empty and this is the default branch of the source; the next step
@@ -801,7 +890,7 @@ jobs:
       - name: Refuse unless the bundle set is complete
         run: bash scripts/check-release-set.sh files "$TAG" "${RUNNER_TEMP}/files.txt"
       - name: Create the release if it does not exist
-        run: bash scripts/publish-release.sh create "$MODE" "$TAG" "${RUNNER_TEMP}/files.txt" "$CERT_SHA256" "$SRC_SHA"
+        run: bash scripts/publish-release.sh create "$MODE" "$TAG" "${RUNNER_TEMP}/files.txt" "$CERT_SHA256" "$SRC_SHA" "$JVM_TESTS"
       - name: Upload the bundles
         run: bash scripts/publish-release.sh upload "$TAG" "${RUNNER_TEMP}/files.txt"
       - name: Verify the release carries the complete set
