@@ -609,6 +609,30 @@ jobs:
       # Next-batch plan, N11, item 7: the signature of the `.app` (Developer ID of the
       # team, notarisation ticket, Gatekeeper), and the SIGNED Bun binaries inside it start
       # under the hardened runtime (a Bun binary without the JIT entitlement stops).
+      # Diagnosis of the staple (owner, 2026-10-25). Tauri runs `xcrun stapler staple` and
+      # does not read its exit status or its output, so a failed staple gives no message.
+      # This step staples a COPY of the app and prints the full answer of Apple. It does
+      # not change the app, the disk image or the update archive. The check of the next
+      # step still decides.
+      - name: Diagnose the staple of the macOS app (a copy)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -uo pipefail
+          app="src-tauri/target/${TRIPLE}/release/bundle/macos/Prenders.app"
+          copy="${RUNNER_TEMP}/staple-diagnosis/Prenders.app"
+          mkdir -p "${RUNNER_TEMP}/staple-diagnosis"
+          ditto "$app" "$copy"
+          echo "== stapler validate -v of the built app"
+          xcrun stapler validate -v "$app"; echo "exit status $?"
+          echo "== stapler staple -v of the copy"
+          xcrun stapler staple -v "$copy"; echo "exit status $?"
+          echo "== stapler validate -v of the copy"
+          xcrun stapler validate -v "$copy"; echo "exit status $?"
+          echo "== the code directory hash of the app"
+          codesign -dvvv "$app" 2>&1 | grep -E '^(CDHash|Identifier|Format)='
       - name: Verify the signature of the macOS app
         if: runner.os == 'macOS'
         env:
