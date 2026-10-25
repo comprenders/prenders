@@ -42,7 +42,7 @@ jobs:
       ANDROID_PLATFORM: android-36
       # The system image of the emulator. Android 15 (API 35), Google APIs, x86_64 for KVM.
       SYSTEM_IMAGE: system-images;android-35;google_apis;x86_64
-      PKG: com.ccchatman.phone
+      PKG: com.comprenders.prenders
     steps:
       # The checkout takes the default branch with every commit and tag, and the next step
       # moves to the commit of `ref`. The checkout action takes only a branch, a tag or a full
@@ -118,7 +118,7 @@ jobs:
           debug=android/app/build/outputs/apk/debug/app-debug.apk
           has_entry() {
             "$aapt2" dump xmltree --file AndroidManifest.xml "$1" | grep -q 'DebugPicturesActivity' && return 0
-            unzip -p "$1" 'classes*.dex' | grep -a -q 'Lcom/ccchatman/phone/DebugPicturesActivity;' && return 0
+            unzip -p "$1" 'classes*.dex' | grep -a -q 'Lcom/comprenders/prenders/DebugPicturesActivity;' && return 0
             return 1
           }
           if has_entry "$release"; then
