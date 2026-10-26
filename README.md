@@ -24,5 +24,5 @@ Each release has:
 
 ## Source code
 
-The source code is not public now. We publish it when enough people show interest.
-To show your interest, star or watch this repository.
+The source code is not public now. **We publish it when enough people show interest.
+To show your interest, star or watch this repository.**
