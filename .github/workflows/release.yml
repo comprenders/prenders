@@ -587,44 +587,21 @@ jobs:
           cat "${RUNNER_TEMP}/tauri-version.json"
       # The two signing secrets sign the update files. The CLI reads them only when
       # `createUpdaterArtifacts` is set, which only the version file above does.
-      # The staple of the macOS app (owner, 2026-10-25). Tauri staples the `.app` before it
-      # makes the disk image and the update archive, so the staple must work inside that
-      # call. This step puts a wrapper of `xcrun` first in PATH. For `stapler staple` it
-      # sends the request again when it fails, at most 6 times with 10 s between tries,
-      # because the ticket service of Apple gives no event to wait for. It writes each try
-      # with the answer of Apple to staple.log (Tauri discards the output). Every other
-      # `xcrun` call goes to /usr/bin/xcrun unchanged. The step "Verify the signature of
-      # the macOS app" still decides.
-      - name: Retry the staple of Tauri when the connection to Apple breaks
+      # The staple of the macOS app. `xcrun stapler` asks the ticket service of Apple
+      # (api.apple-cloudkit.com) over HTTP/3, which runs on UDP port 443. On the hosted Mac
+      # machines of GitHub that UDP path drops the request (NSURLError -1005, staple error
+      # 68; actions/runner-images#14924, open since 2026-10-12), while the same request over
+      # TCP works. This step refuses outbound UDP 443 for this job only, so the request goes
+      # over HTTPS on TCP, the workaround that GitHub gives in that issue. Tauri staples
+      # inside its build call, and the step "Verify the signature of the macOS app"
+      # (`stapler validate`) asks the same service, so the rule is set before both.
+      - name: Send the requests to Apple over TCP (actions/runner-images#14924)
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          dir="${RUNNER_TEMP}/xcrun-staple"
-          mkdir -p "$dir"
-          : > "$dir/staple.log"
-          cat > "$dir/xcrun" <<'WRAPPER'
-          #!/bin/bash
-          if [ "${1:-}" = stapler ] && [ "${2:-}" = staple ]; then
-            log="${RUNNER_TEMP}/xcrun-staple/staple.log"
-            for try in 1 2 3 4 5 6; do
-              if out=$(/usr/bin/xcrun "$@" 2>&1); then
-                echo "staple try ${try}: done" >> "$log"
-                echo "$out"
-                exit 0
-              else
-                status=$?
-              fi
-              { echo "staple try ${try}: exit status ${status}"; echo "$out" | tail -n 8; } >> "$log"
-              [ "$try" -lt 6 ] && sleep 10
-            done
-            echo "$out" >&2
-            exit "$status"
-          fi
-          exec /usr/bin/xcrun "$@"
-          WRAPPER
-          chmod +x "$dir/xcrun"
-          echo "$dir" >> "$GITHUB_PATH"
+          echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f -
+          sudo pfctl -E
       - name: Build Tauri bundle
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
@@ -647,15 +624,6 @@ jobs:
       # Next-batch plan, N11, item 7: the signature of the `.app` (Developer ID of the
       # team, notarisation ticket, Gatekeeper), and the SIGNED Bun binaries inside it start
       # under the hardened runtime (a Bun binary without the JIT entitlement stops).
-      # Owner, 2026-10-25 (the cause of the failed staples of v0.27.0 and v0.27.1): Tauri runs
-      # `xcrun stapler staple` ONE time and reads neither its exit status nor its output.
-      # From the Intel machine of GitHub the connection to the ticket service of Apple
-      # (api.apple-cloudkit.com) often breaks in the middle of a request (NSURLError -1005,
-      # staple error 68), also when a request seconds before got the same ticket.
-      - name: Print the staple log of the macOS app
-        if: always() && runner.os == 'macOS'
-        shell: bash
-        run: cat "${RUNNER_TEMP}/xcrun-staple/staple.log"
       - name: Verify the signature of the macOS app
         if: runner.os == 'macOS'
         env:
