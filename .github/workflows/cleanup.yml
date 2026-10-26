@@ -1,13 +1,13 @@
 name: cleanup
 
-# After each run of `build` and of `release`, delete the logs and the artifacts of that run.
+# After each run of `release`, delete the logs and the artifacts of that run.
 # The logs can show lines of the source code (compiler warnings, failed tests), and the source
 # is not public. The artifacts of a `release` run are used by its own `publish` job, so they
 # have no use after the run.
 
 on:
   workflow_run:
-    workflows: [build, release]
+    workflows: [release]
     types: [completed]
 
 permissions:

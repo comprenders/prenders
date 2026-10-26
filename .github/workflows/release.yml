@@ -59,7 +59,7 @@ concurrency:
 
 jobs:
   # The one place that turns the tag into a commit. It refuses unless the tag exists in
-  # the source repository and its commit is on master (the signing rule of `build.yml`).
+  # the source repository and its commit is on master. Only a commit on master is signed.
   resolve:
     name: resolve
     runs-on: ubuntu-latest
@@ -556,8 +556,8 @@ jobs:
       # `tauri.conf.json` has no version (plan-r3 7.1). The bundle takes the version of the
       # identity through `--config`, so the file names and the installer carry it.
       # The update from inside the app: only this file sets `createUpdaterArtifacts` and the
-      # endpoint of `latest.json`, so a dev build and a run from the source make no update
-      # file and have no endpoint. The endpoint is the newest published release of THIS
+      # endpoint of `latest.json`, so a build from the source makes no update
+      # file and has no endpoint. The endpoint is the newest published release of THIS
       # repository, because the releases are here.
       # Next-batch plan, N11, item 4: on macOS the file also sets the Developer ID identity,
       # so the release does not depend on the order of the env value and the "-" of
