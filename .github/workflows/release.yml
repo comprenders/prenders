@@ -737,6 +737,15 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      # Row REL2-4: the Gradle task `checkRunDataSafety` runs the check of a test run
+      # (`backend/tests/helpers/run-data-safety.ts` of the app repository) with Bun before
+      # the JVM tests, so this job needs Bun. The same step is in the android job of ci.yml
+      # there.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
+        # of the app repository, and as ci.yml there.
+        with:
+          bun-version: "1.4.0"
       # Plan-r3 2.2 item 1 (K4): the APK holds the phone page of the web build of this commit.
       # Gradle task `copyPhonePage` copies it from `manager/web/dist` and stops when the
       # identity of that build is not the identity of the APK.
