@@ -385,6 +385,16 @@ jobs:
       - name: Install frontend dependencies
         working-directory: manager/web
         run: npm ci
+      # The source scans of the web tests import `backend/tests/helpers/source-scan.ts` of the
+      # app repository, which reads the TypeScript 5 parser of the backend copy by its path, and
+      # the web build type-checks them. So this job installs the backend packages too, as the
+      # frontend job of ci.yml there does. The Bun pin is the pin of the backend job.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.0"
+      - name: Install backend dependencies for the source scans
+        working-directory: backend
+        run: bun install --frozen-lockfile
       - name: Build frontend
         working-directory: manager/web
         run: npm run build
@@ -757,6 +767,11 @@ jobs:
       - name: Install frontend dependencies
         working-directory: manager/web
         run: npm ci
+      # The web build type-checks `backend/tests/helpers/source-scan.ts`, which reads the
+      # TypeScript 5 of the backend copy by its path (see the frontend job). Bun is set up above.
+      - name: Install backend dependencies for the source scans
+        working-directory: backend
+        run: bun install --frozen-lockfile
       - name: Build frontend for the APK
         working-directory: manager/web
         env:
