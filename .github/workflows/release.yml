@@ -135,6 +135,10 @@ jobs:
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
       SHELLCHECK_VERSION: 0.11.0
       SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+      # yq reads the job graph of this file for the step "Each package job needs every
+      # test job". The digest is the one that GitHub gives for the asset yq_linux_amd64.
+      YQ_VERSION: 4.54.1
+      YQ_SHA256: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -158,6 +162,43 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}" --strip-components=1 \
             "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
           "${RUNNER_TEMP}/shellcheck" --version
+      - name: Install yq
+        run: |
+          set -euo pipefail
+          binary="${RUNNER_TEMP}/yq"
+          curl -fsSL --retry 3 -o "$binary" \
+            "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  ${binary}" | sha256sum --check --strict
+          chmod +x "$binary"
+          "$binary" --version
+      # A package job starts only after every test job passed, so a failed test makes no
+      # package (backlog 2026-11-04, row 12). PACKAGE_JOBS is the one list of the package
+      # jobs. Every other job, except `publish`, is a test job, so a new test job is
+      # required at once. A new package job that is not in the list counts as a test job,
+      # and the package jobs do not need it, so this step fails until the list names it.
+      # A `needs:` that is not direct counts (android-sign needs android, which needs the
+      # tests). `publish` must need every other job, because its first step checks only
+      # the jobs that it needs.
+      - name: Each package job needs every test job
+        env:
+          PACKAGE_JOBS: '["bundle", "android", "android-sign"]'
+        run: |
+          set -euo pipefail
+          faults=$("${RUNNER_TEMP}/yq" -o=json '.jobs' .github/workflows/release.yml \
+            | jq -r --argjson packages "$PACKAGE_JOBS" '
+                def needs($job): (.[$job].needs // []) | if type == "string" then [.] else . end;
+                def closure($job): [needs($job)[] as $n | $n, closure($n)[]] | unique;
+                (keys) as $all
+                | ($all - $packages - ["publish"]) as $tests
+                | ($packages - $all | .[] | "the package job \(.) is not in the file"),
+                  ($packages[] as $p | select($p | IN($all[]))
+                    | $tests - closure($p) | .[] | "the package job \($p) does not need the test job \(.)"),
+                  ($all - ["publish"] - needs("publish") | .[] | "the job publish does not need the job \(.)")')
+          if [ -n "$faults" ]; then
+            echo "$faults" >&2
+            exit 1
+          fi
+          echo "release: each package job needs every test job, and publish needs every job"
       # Build review A1: this run holds the signing secrets and the write token, so every
       # action of every workflow of this repository is named by a commit hash, which cannot
       # move. A tag such as `@v4` can move. The comment after the hash names the tag.
@@ -438,9 +479,13 @@ jobs:
   # Build only: tauri-action gets no `tagName` and no `releaseId`, so it makes no
   # release-API call. The release is made by `publish`, once, after every check.
   # CHATMAN_RELEASE_REPO is THIS repository, because the releases are here.
+  # The package jobs (`bundle`, `android`, `android-sign`) start only after every test job
+  # passed (backlog 2026-11-04, row 12). This is different from ci.yml of the source,
+  # where they start after `resolve` only. The step "Each package job needs every test
+  # job" of `actionlint` keeps this order.
   bundle:
     name: bundle (${{ matrix.triple }})
-    needs: resolve
+    needs: [resolve, actionlint, backend, smoke-windows, frontend, python]
     runs-on: ${{ matrix.os }}
     # Next-batch plan, N11: the GitHub environment `release-signing` holds the seven Apple
     # secrets. Only the macOS legs get it; the Windows leg has an empty name, so no
@@ -720,7 +765,7 @@ jobs:
   # `android-sign`, on another runner.
   android:
     name: android
-    needs: resolve
+    needs: [resolve, actionlint, backend, smoke-windows, frontend, python]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
