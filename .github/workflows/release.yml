@@ -450,11 +450,18 @@ jobs:
       # the backend test helpers), so this job is the one owner of the frontend setup, as the
       # frontend job of ci.yml there. The browser is the headless shell of the installed
       # `playwright` package, with the system libraries that it needs. It needs no secret.
+      # Both steps name one browser folder (PLAYWRIGHT_BROWSERS_PATH): the browser suite sets
+      # HOME to a fixture home (`test-setup/run-home.ts`), so the default cache under the real
+      # home is not where the run looks.
       - name: Install the browser of the layout tests
         working-directory: manager/web
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
         run: npx playwright install --with-deps --only-shell chromium
       - name: Test the phone layout in a real browser
         working-directory: manager/web
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
         run: npm run test:browser
       - name: Audit frontend dependencies
         working-directory: manager/web
