@@ -405,7 +405,8 @@ jobs:
     name: frontend
     needs: resolve
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Row 59: the job runs the jsdom suite and the browser suite, which had 30 minutes each.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -442,56 +443,22 @@ jobs:
       - name: Test frontend
         working-directory: manager/web
         run: npm test
-      - name: Audit frontend dependencies
-        working-directory: manager/web
-        run: npm audit --audit-level=high
-
-  # Backlog 2026-11-04 reader-voice, row 48 (owner decision 2026-11-06, the test method):
-  # the tests that see the real phone layout (`*.browser.test.tsx`,
-  # `manager/web/vitest.browser.config.ts`) run here in Chromium on Linux, so a release does
-  # not need the PC for them. The frontend job of ci.yml runs the same two steps. The setup
-  # steps are those of `frontend`: the global setup of the browser suite
-  # (`test-setup/run-home.ts`) imports the backend test helpers, so the job installs the
-  # backend packages too. The browser is the headless shell of the installed `playwright`
-  # package, with the system libraries that it needs. The job needs no secret except the
-  # read of the source.
-  frontend-browser:
-    name: frontend-browser
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: ${{ secrets.SOURCE_REPO }}
-          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
-          ref: ${{ needs.resolve.outputs.sha }}
-          persist-credentials: false
-      - name: Write the build identity of the tag
-        shell: bash
-        env:
-          IDENTITY: ${{ needs.resolve.outputs.identity }}
-        run: node scripts/build-identity.mjs --from "$IDENTITY"
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: manager/web/package-lock.json
-      - name: Install frontend dependencies
-        working-directory: manager/web
-        run: npm ci
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: "1.4.0"
-      - name: Install backend dependencies for the test setup
-        working-directory: backend
-        run: bun install --frozen-lockfile
+      # Backlog 2026-11-04 reader-voice, rows 48 and 59: the tests that see the real phone
+      # layout (`*.browser.test.tsx`, `manager/web/vitest.browser.config.ts`) run here in
+      # Chromium on Linux, so a release does not need the PC for them. They use the setup
+      # steps above (the global setup of the browser suite, `test-setup/run-home.ts`, imports
+      # the backend test helpers), so this job is the one owner of the frontend setup, as the
+      # frontend job of ci.yml there. The browser is the headless shell of the installed
+      # `playwright` package, with the system libraries that it needs. It needs no secret.
       - name: Install the browser of the layout tests
         working-directory: manager/web
         run: npx playwright install --with-deps --only-shell chromium
       - name: Test the phone layout in a real browser
         working-directory: manager/web
         run: npm run test:browser
+      - name: Audit frontend dependencies
+        working-directory: manager/web
+        run: npm audit --audit-level=high
 
   python:
     name: python (${{ matrix.python-version }})
@@ -532,7 +499,7 @@ jobs:
   # job" of `actionlint` keeps this order.
   bundle:
     name: bundle (${{ matrix.triple }})
-    needs: [resolve, actionlint, backend, smoke-windows, frontend, frontend-browser, python]
+    needs: [resolve, actionlint, backend, smoke-windows, frontend, python]
     runs-on: ${{ matrix.os }}
     # Next-batch plan, N11: the GitHub environment `release-signing` holds the seven Apple
     # secrets. Only the macOS legs get it; the Windows leg has an empty name, so no
@@ -812,7 +779,7 @@ jobs:
   # `android-sign`, on another runner.
   android:
     name: android
-    needs: [resolve, actionlint, backend, smoke-windows, frontend, frontend-browser, python]
+    needs: [resolve, actionlint, backend, smoke-windows, frontend, python]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -966,7 +933,7 @@ jobs:
   # failed job does not skip this job; the first step names it and refuses.
   publish:
     name: publish
-    needs: [resolve, actionlint, backend, smoke-windows, frontend, frontend-browser, python, bundle, android, android-sign]
+    needs: [resolve, actionlint, backend, smoke-windows, frontend, python, bundle, android, android-sign]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
