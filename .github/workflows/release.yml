@@ -910,6 +910,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             android/release-cert.sha256
+            scripts/release-names-cli.mjs
             scripts/release-names.mjs
             scripts/sign-apk.sh
           sparse-checkout-cone-mode: false
@@ -931,8 +932,9 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           mkdir -p "${RUNNER_TEMP}/signed"
-          # The one owner of the APK name is `release-names.mjs`.
-          signed="${RUNNER_TEMP}/signed/$(node scripts/release-names.mjs apk "$version")"
+          # The one owner of the APK name is `release-names.mjs`; its command line is
+          # `release-names-cli.mjs`.
+          signed="${RUNNER_TEMP}/signed/$(node scripts/release-names-cli.mjs apk "$version")"
           bash scripts/sign-apk.sh "${RUNNER_TEMP}/android-unsigned/app-release-unsigned.apk" "$signed" \
             | tee "${RUNNER_TEMP}/sign.log"
           digest=$(tail -n 1 "${RUNNER_TEMP}/sign.log")
@@ -977,6 +979,7 @@ jobs:
             scripts/check-release-set.sh
             scripts/android-release-notes.sh
             scripts/publish-release.sh
+            scripts/release-names-cli.mjs
             scripts/release-names.mjs
             scripts/release-notes.mjs
             scripts/updater-manifest.mjs
