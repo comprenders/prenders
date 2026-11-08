@@ -250,13 +250,18 @@ jobs:
         # of the app repository, and as ci.yml there.
         with:
           bun-version: "1.4.0"
+      # Each check runs when its setup passed, so a type error does not hide a test failure
+      # (OD7 of the process rework, round 3). The form of `smoke-windows`.
       - name: Install backend dependencies
+        id: deps
         working-directory: backend
         run: bun install --frozen-lockfile
       - name: Type-check backend
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         working-directory: backend
         run: bun run typecheck
       - name: Test backend
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         working-directory: backend
         run: bun run test
 
@@ -421,6 +426,7 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
       - name: Write the build identity of the tag
+        id: identity
         shell: bash
         env:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
@@ -431,6 +437,7 @@ jobs:
           cache: npm
           cache-dependency-path: manager/web/package-lock.json
       - name: Install frontend dependencies
+        id: web-deps
         working-directory: manager/web
         run: npm ci
       # The source scans of the web tests import `backend/tests/helpers/source-scan.ts` of the
@@ -441,12 +448,18 @@ jobs:
         with:
           bun-version: "1.4.0"
       - name: Install backend dependencies for the source scans
+        id: backend-deps
         working-directory: backend
         run: bun install --frozen-lockfile
+      # Each check runs when its setup passed, so one failed check does not hide the result
+      # of the next one (OD7 of the process rework, round 3). The form of `smoke-windows`.
+      # The build is a check here (it type-checks); no later step reads `dist`.
       - name: Build frontend
+        if: ${{ !cancelled() && steps.web-deps.outcome == 'success' && steps.backend-deps.outcome == 'success' }}
         working-directory: manager/web
         run: npm run build
       - name: Test frontend
+        if: ${{ !cancelled() && steps.web-deps.outcome == 'success' && steps.backend-deps.outcome == 'success' }}
         working-directory: manager/web
         run: npm test
       # Backlog 2026-11-04 reader-voice, rows 48 and 59: the tests that see the real phone
@@ -460,16 +473,20 @@ jobs:
       # HOME to a fixture home (`test-setup/run-home.ts`), so the default cache under the real
       # home is not where the run looks.
       - name: Install the browser of the layout tests
+        id: browser
+        if: ${{ !cancelled() && steps.web-deps.outcome == 'success' }}
         working-directory: manager/web
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
         run: npx playwright install --with-deps --only-shell chromium
       - name: Test the phone layout in a real browser
+        if: ${{ !cancelled() && steps.web-deps.outcome == 'success' && steps.backend-deps.outcome == 'success' && steps.browser.outcome == 'success' }}
         working-directory: manager/web
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
         run: npm run test:browser
       - name: Audit frontend dependencies
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' }}
         working-directory: manager/web
         run: npm audit --audit-level=high
 
@@ -494,14 +511,176 @@ jobs:
           python-version: ${{ matrix.python-version }}
       # The app ships the four /wiki tools of tools/ (tauri.conf.json resources), so
       # this job checks tools/ only. The old manager/ Python server is removed.
+      # Each check runs when its setup passed (OD7 of the process rework, round 3).
       - name: Install Python package
+        id: deps
         run: pip install -e ".[dev]"
       - name: Lint
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: ruff check tools
       - name: Type-check
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pyright tools
       - name: Test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pytest tools/tests --tb=short -q
+
+  # The Rust tests are a test job, so a Rust test failure shows in the same run as every
+  # other test failure (OD7 of the process rework, round 3). In ci.yml of the source they
+  # run inside `bundle`. The build of `tauri.conf.json` needs the sidecar
+  # (`binaries/chatman`) and the web build (`../manager/web/dist`), so this job makes both
+  # with the steps of `bundle`. No secret except the read-only source key.
+  rust:
+    name: rust (${{ matrix.triple }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            triple: aarch64-apple-darwin
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - name: Write the build identity of the tag
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
+        # of the app repository, and as ci.yml there.
+        with:
+          bun-version: "1.4.0"
+      - name: Install backend dependencies
+        working-directory: backend
+        run: bun install --frozen-lockfile
+      - name: Build backend sidecar
+        working-directory: backend
+        env:
+          CHATMAN_RELEASE_REPO: ${{ github.repository }}
+          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+        run: bun run build:sidecar:${{ matrix.triple }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: manager/web/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: manager/web
+        run: npm ci
+      - name: Build frontend
+        working-directory: manager/web
+        env:
+          CHATMAN_RELEASE_REPO: ${{ github.repository }}
+          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+        run: npm run build
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          # With a commit hash in `uses:` the action cannot take the toolchain from the
+          # ref name, so the floating `stable` is named here (plan-r3 L1001).
+          toolchain: stable
+          targets: ${{ matrix.triple }}
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+  # The Android JVM tests are a test job, so an Android test failure shows in the same run
+  # as every other test failure (OD7 of the process rework, round 3). In ci.yml of the
+  # source they run inside `android`. The setup is the setup of `android`; the reasons of
+  # each step are there.
+  android-test:
+    name: android-test
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # Next-batch plan, N9: the count line of the JVM tests, for the release notes.
+    outputs:
+      jvm_tests: ${{ steps.jvm.outputs.jvm_tests }}
+    env:
+      ANDROID_BUILD_TOOLS_VERSION: 36.0.0
+      ANDROID_PLATFORM: android-36
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - name: Write the build identity of the tag
+        shell: bash
+        env:
+          IDENTITY: ${{ needs.resolve.outputs.identity }}
+        run: node scripts/build-identity.mjs --from "$IDENTITY"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      # Row REL2-4: the Gradle task `checkRunDataSafety` runs before the JVM tests with Bun.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
+        # of the app repository, and as ci.yml there.
+        with:
+          bun-version: "1.4.0"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: manager/web/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: manager/web
+        run: npm ci
+      - name: Install backend dependencies for the source scans
+        working-directory: backend
+        run: bun install --frozen-lockfile
+      - name: Build frontend for the APK
+        working-directory: manager/web
+        env:
+          CHATMAN_RELEASE_REPO: ${{ github.repository }}
+          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+        run: npm run build
+      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
+        with:
+          gradle-version: 9.6.1
+      - name: Require the SDK packages
+        run: |
+          set -euo pipefail
+          for need in "build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2" "platforms/${ANDROID_PLATFORM}/android.jar"; do
+            if [ ! -f "${ANDROID_HOME}/${need}" ]; then
+              echo "android-test: ${ANDROID_HOME}/${need} is not on this runner image; the job installs no SDK package" >&2
+              exit 1
+            fi
+          done
+      - name: Test the Android app
+        run: gradle -p android testDebugUnitTest
+      # Next-batch plan, N9: `cleanup.yml` deletes the log of a green run, so the count goes
+      # to the job summary and, through the job output, to the release notes. No result
+      # file, or no test, fails the job.
+      - name: Count the Android JVM tests
+        id: jvm
+        run: |
+          set -euo pipefail
+          line=$(node scripts/junit-count.mjs)
+          printf '%s\n' "$line" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'jvm_tests=%s\n' "$line" >> "$GITHUB_OUTPUT"
 
   # Build only: tauri-action gets no `tagName` and no `releaseId`, so it makes no
   # release-API call. The release is made by `publish`, once, after every check.
@@ -512,7 +691,7 @@ jobs:
   # job" of `actionlint` keeps this order.
   bundle:
     name: bundle (${{ matrix.triple }})
-    needs: [resolve, actionlint, backend, smoke-windows, frontend, python]
+    needs: [resolve, actionlint, backend, smoke-windows, frontend, python, rust, android-test]
     runs-on: ${{ matrix.os }}
     # Next-batch plan, N11: the GitHub environment `release-signing` holds the seven Apple
     # secrets. Only the macOS legs get it; the Windows leg has an empty name, so no
@@ -633,8 +812,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
-      - name: Test Rust
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      # The Rust tests run in the test job `rust`, not here (OD7 of the process rework).
       # `tauri.conf.json` has no version (plan-r3 7.1). The bundle takes the version of the
       # identity through `--config`, so the file names and the installer carry it.
       # The update from inside the app: only this file sets `createUpdaterArtifacts` and the
@@ -792,14 +970,11 @@ jobs:
   # `android-sign`, on another runner.
   android:
     name: android
-    needs: [resolve, actionlint, backend, smoke-windows, frontend, python]
+    needs: [resolve, actionlint, backend, smoke-windows, frontend, python, rust, android-test]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
-    # Next-batch plan, N9: the count line of the JVM tests, for the release notes.
-    outputs:
-      jvm_tests: ${{ steps.jvm.outputs.jvm_tests }}
     env:
       ANDROID_BUILD_TOOLS_VERSION: 36.0.0
       ANDROID_PLATFORM: android-36
@@ -819,10 +994,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      # Row REL2-4: the Gradle task `checkRunDataSafety` runs the check of a test run
-      # (`backend/tests/helpers/run-data-safety.ts` of the app repository) with Bun before
-      # the JVM tests, so this job needs Bun. The same step is in the android job of ci.yml
-      # there.
+      # The step "Install backend dependencies for the source scans" below needs Bun. The
+      # JVM tests, which also need Bun (row REL2-4, `checkRunDataSafety`), run in
+      # `android-test`.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
         # of the app repository, and as ci.yml there.
@@ -862,18 +1036,8 @@ jobs:
               exit 1
             fi
           done
-      - name: Test the Android app
-        run: gradle -p android testDebugUnitTest
-      # Next-batch plan, N9: `cleanup.yml` deletes the log of a green run, so the count goes
-      # to the job summary and, through the job output, to the release notes. No result
-      # file, or no test, fails the job.
-      - name: Count the Android JVM tests
-        id: jvm
-        run: |
-          set -euo pipefail
-          line=$(node scripts/junit-count.mjs)
-          printf '%s\n' "$line" | tee -a "$GITHUB_STEP_SUMMARY"
-          printf 'jvm_tests=%s\n' "$line" >> "$GITHUB_OUTPUT"
+      # The JVM tests and their count run in the test job `android-test`, not here (OD7 of
+      # the process rework).
       - name: Build the unsigned release APK
         run: gradle -p android assembleRelease
       - name: Check the package line of the APK
@@ -950,7 +1114,7 @@ jobs:
   # failed job does not skip this job; the first step names it and refuses.
   publish:
     name: publish
-    needs: [resolve, actionlint, backend, smoke-windows, frontend, python, bundle, android, android-sign]
+    needs: [resolve, actionlint, backend, smoke-windows, frontend, python, rust, android-test, bundle, android, android-sign]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -963,8 +1127,8 @@ jobs:
       MODE: ${{ inputs.draft && 'draft' || 'release' }}
       SRC_SHA: ${{ needs.resolve.outputs.sha }}
       CERT_SHA256: ${{ needs.android-sign.outputs.cert_sha256 }}
-      # Next-batch plan, N9: the count line of the JVM tests that `android` printed.
-      JVM_TESTS: ${{ needs.android.outputs.jvm_tests }}
+      # Next-batch plan, N9: the count line of the JVM tests that `android-test` printed.
+      JVM_TESTS: ${{ needs.android-test.outputs.jvm_tests }}
     steps:
       # The scripts of the release steps, from the source. When `resolve` failed, its
       # output is empty and this is the default branch of the source; the next step
