@@ -1147,6 +1147,8 @@ jobs:
             scripts/release-names.mjs
             scripts/release-notes.mjs
             scripts/updater-manifest.mjs
+            scripts/junit-count.mjs
+            scripts/check-android-test-list.mjs
             release-notes/
             test-vectors/release-body-marks.json
           sparse-checkout-cone-mode: false
