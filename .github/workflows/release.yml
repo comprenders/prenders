@@ -14,11 +14,16 @@ name: release
 # source is read with a read-only deploy key (secret SOURCE_DEPLOY_KEY) from the
 # repository named in the secret SOURCE_REPO.
 #
-# The jobs are the jobs of the release run of `.github/workflows/ci.yml` of the source
-# repository, which has no tag trigger since 2026-10-08. The reasons for each step are in
-# the comments of that file; this file gives only what is different here. The steps of
-# `publish` that touch the release are in `scripts/publish-release.sh` of the source, and
-# ci.yml runs the same script.
+# This file is the one release workflow (plan of 2026-11-08, row F5a+RL1a+TC1): the source
+# repository has no workflow file since that row. The jobs:
+# - `resolve` turns the tag into a commit and makes the build identity.
+# - `workflow-guards` lints the workflow files of this repository and checks the relations
+#   between the jobs (yq and jq) and the Bun pin against the source.
+# - `static-rules` runs the Opengrep rules of the source on the source tree and on this file.
+# - The test jobs: `backend`, `smoke-windows`, `frontend`, `python`, `rust`, `android-test`.
+# - The package jobs: `bundle`, `android`, `android-sign`. Each needs every job above.
+# - `publish` makes the release. The steps that touch the release are in
+#   `scripts/publish-release.sh` of the source.
 #
 # Every job builds the commit that `resolve` found for the tag, never the tag name, so a
 # tag that moves during the run changes nothing.
@@ -50,6 +55,12 @@ run-name: release ${{ inputs.tag }}${{ inputs.draft && ' (draft)' || '' }}
 
 permissions:
   contents: read
+
+# The one Bun pin of the workflow. Every setup-bun step names it (the Opengrep rule
+# `release-bun-pin-from-env` of the source), and the job `workflow-guards` compares it with
+# `BUN_PIN` of `backend/scripts/build-sidecar.ts` of the source.
+env:
+  BUN_VERSION: "1.4.0"
 
 # Two runs for one tag could each find no release and each create one. The second run
 # waits for the first.
@@ -128,14 +139,16 @@ jobs:
       - name: Test the build identity and that no file holds the version
         run: node --test scripts/tests/*.test.mjs
 
-  # The private ci.yml lints its own workflow files. Here the release path is the files
-  # of THIS repository, so this job lints them: a malformed expression, an unknown
-  # `needs:` or a matrix key that is not defined can survive the parse of GitHub and give
-  # an empty value instead of an error. The same pinned versions and digests as ci.yml.
-  actionlint:
-    name: actionlint
+  # The guards of the workflow files of this repository (base design-02 3.1 of the cleanup
+  # plan). actionlint: a malformed expression, an unknown `needs:` or a matrix key that is
+  # not defined can survive the parse of GitHub and give an empty value instead of an
+  # error. The yq and jq steps check the relations between jobs. The pattern guards are the
+  # Opengrep rules of the job `static-rules`.
+  workflow-guards:
+    name: workflow-guards
+    needs: resolve
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       ACTIONLINT_VERSION: 1.7.12
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
@@ -149,6 +162,38 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # The source at the tag commit, in `source/`: the Bun pin step imports `BUN_PIN`, and
+      # the script path step looks for each path that a job names.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install backend dependencies for the Bun pin step
+        working-directory: source/backend
+        run: bun install --frozen-lockfile
+      # `build-sidecar.ts` refuses a Bun that is not BUN_PIN, so a release with two pins
+      # fails late, in `bundle`. This step fails at the start. Plain `node -e` cannot
+      # import a `.ts` file; `bun -e` can. The import runs no build: the script builds only
+      # under `import.meta.main`.
+      - name: The workflow Bun pin is BUN_PIN of the source
+        env:
+          SIDECAR: ${{ github.workspace }}/source/backend/scripts/build-sidecar.ts
+        run: |
+          set -euo pipefail
+          bun -e '
+            const { BUN_PIN } = await import(process.env.SIDECAR);
+            if (BUN_PIN !== process.env.BUN_VERSION) {
+              console.error("release: the workflow env BUN_VERSION is " + process.env.BUN_VERSION + ", BUN_PIN of the sidecar build script is " + BUN_PIN);
+              process.exit(1);
+            }
+            console.log("release: BUN_VERSION and BUN_PIN are " + BUN_PIN);
+          '
       - name: Install actionlint
         run: |
           set -euo pipefail
@@ -205,6 +250,90 @@ jobs:
             exit 1
           fi
           echo "release: each package job needs every test job, and publish needs every job"
+      # An artifact is kept for a known time, and a download names an artifact that a job
+      # before it uploads. A download by a name or a pattern that no needed job uploads
+      # gets no file, and the step after it fails with a cause that names no artifact.
+      - name: Each artifact has a retention, and each download has its upload
+        run: |
+          set -euo pipefail
+          faults=$("${RUNNER_TEMP}/yq" -o=json '.jobs' .github/workflows/release.yml \
+            | jq -r '
+                def needs($job): (.[$job].needs // []) | if type == "string" then [.] else . end;
+                def closure($job): [needs($job)[] as $n | $n, closure($n)[]] | unique;
+                def steps_using($job; $action):
+                  (.[$job].steps // [])[] | select((.uses // "") | startswith($action + "@"));
+                . as $jobs
+                | [keys[] as $j | $jobs | steps_using($j; "actions/upload-artifact") | {job: $j, name: .with.name, days: .with["retention-days"]}] as $uploads
+                | ($uploads[] | select(.days == null) | "the upload \(.name) of the job \(.job) has no retention-days"),
+                  (keys[] as $j | $jobs | steps_using($j; "actions/download-artifact")
+                    | (.with.name // .with.pattern) as $want
+                    | ($want | gsub("\\*"; ".*") | "^" + . + "$") as $re
+                    | ($jobs | closure($j)) as $before
+                    | select([$uploads[] | select(.job | IN($before[])) | select(.name | test($re))] | length == 0)
+                    | "the job \($j) downloads \($want), which no job that it needs uploads")')
+          if [ -n "$faults" ]; then
+            echo "$faults" >&2
+            exit 1
+          fi
+          echo "release: each artifact has a retention, and each download has its upload"
+      # Each script path that a `run:` names exists in the checkout of its job: the source
+      # at the tag commit (`source/` here), inside the sparse set when the job has one. A
+      # path of a job that checks out the source into a folder (`path:`) is read inside
+      # that folder; any other path of such a job is a path of this repository. A job with
+      # a script that is not in its checkout fails late, after its setup (review RC-7).
+      - name: Each script path that a job runs is in the checkout of the job
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/yq" -o=json '.jobs' .github/workflows/release.yml \
+            | jq -r '
+                to_entries[] | .key as $job | (.value.steps // []) as $steps
+                | ([$steps[] | select((.uses // "") | startswith("actions/checkout@"))
+                    | select((.with.repository // "") | test("SOURCE_REPO"))][0] // null) as $src
+                | (if $src == null then null else ($src.with.path // "") end) as $root
+                | (if $src == null or ($src.with["sparse-checkout"] // null) == null then null
+                   else [$src.with["sparse-checkout"] | split("\n")[] | select(length > 0)] end) as $sparse
+                | $steps[] | select(.run != null)
+                | (.["working-directory"] // "") as $wd
+                | .run | gsub("\\\\"; "/")
+                | [scan("(?:^|[\\s\"'"'"'=])(?:\\./)?([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\\.(?:mjs|cjs|js|ts|sh|ps1|py))(?=$|[\\s\"'"'"';)])")[0]] | unique[]
+                | (if $wd == "" then . else $wd + "/" + . end) as $path
+                | if $root == null or ($root != "" and ($path | startswith($root + "/") | not)) then
+                    "\($job)\tthis\t\($path)\t"
+                  else
+                    (if $root == "" then $path else $path[($root | length) + 1:] end) as $rel
+                    | "\($job)\tsource\t\($rel)\t\($sparse // [] | join(" "))"
+                  end' | sort -u > "${RUNNER_TEMP}/script-paths.tsv"
+          faults=0
+          while IFS=$'\t' read -r job where path sparse; do
+            if [ "$where" = this ]; then
+              [ -e "$path" ] && continue
+              echo "the job ${job} runs ${path}, which is not in this repository" >&2
+              faults=$((faults + 1))
+              continue
+            fi
+            if [ ! -e "source/${path}" ]; then
+              echo "the job ${job} runs ${path}, which is not in the source at the tag commit" >&2
+              faults=$((faults + 1))
+              continue
+            fi
+            if [ -n "$sparse" ]; then
+              found=no
+              for entry in $sparse; do
+                entry="${entry#/}"
+                if [ "$path" = "$entry" ] || { [ "${entry%/}" != "$entry" ] && [ "${path#"$entry"}" != "$path" ]; }; then
+                  found=yes
+                fi
+              done
+              if [ "$found" = no ]; then
+                echo "the job ${job} runs ${path}, which is not in the sparse checkout of the job" >&2
+                faults=$((faults + 1))
+              fi
+            fi
+          done < "${RUNNER_TEMP}/script-paths.tsv"
+          if [ "$faults" -ne 0 ]; then
+            exit 1
+          fi
+          echo "release: each script path is in the checkout of its job ($(wc -l < "${RUNNER_TEMP}/script-paths.tsv") paths)"
       # Build review A1: this run holds the signing secrets and the write token, so every
       # action of every workflow of this repository is named by a commit hash, which cannot
       # move. A tag such as `@v4` can move. The comment after the hash names the tag.
@@ -224,6 +353,33 @@ jobs:
           "${RUNNER_TEMP}/actionlint" -color \
             -shellcheck="${RUNNER_TEMP}/shellcheck" -pyflakes=
 
+  # The Opengrep rules of the source (base design-01 3.4 and design-02 3.9 of the cleanup
+  # plan): the rule fixtures, then the scan of the source tree, then the scan of this file
+  # with the workflow rules (`release-workflow-guards.yml`). The scan of this file names
+  # its absolute path: a relative path into another git checkout gives no file to scan.
+  static-rules:
+    name: static-rules
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - name: Install the pinned Opengrep
+        run: bash source/scripts/install-opengrep.sh
+      - name: The rules and the scan of the source
+        run: bash source/scripts/static-rules.sh
+      - name: The workflow rules on this release workflow
+        run: bash source/scripts/static-rules.sh "${GITHUB_WORKSPACE}/.github/workflows/release.yml"
+
   backend:
     name: backend (${{ matrix.os }})
     needs: resolve
@@ -233,6 +389,19 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
+        # Row TC1: the abilities of each runner image (`backend/tests/helpers/platform-fs.ts`
+        # of the source). The global setup of the tests stops the run when a probe
+        # disagrees. The values are facts of the images; the draft run of row RL1b
+        # confirms them.
+        include:
+          - os: ubuntu-latest
+            abilities: symlink,deny-dir-access
+          - os: macos-15
+            abilities: symlink,deny-dir-access,case-insensitive-volume
+          - os: windows-latest
+            abilities: junction,case-insensitive-volume
+    env:
+      PRENDERS_ABILITIES: ${{ matrix.abilities }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -246,10 +415,9 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
-        # of the app repository, and as ci.yml there.
+        # The Bun of the build: the workflow env BUN_VERSION.
         with:
-          bun-version: "1.4.0"
+          bun-version: ${{ env.BUN_VERSION }}
       # Each check runs when its setup passed, so a type error does not hide a test failure
       # (OD7 of the process rework, round 3). The form of `smoke-windows`.
       - name: Install backend dependencies
@@ -265,13 +433,16 @@ jobs:
         working-directory: backend
         run: bun run test
 
-  # The only job that runs the shipped runtime on Windows. The units, their timeouts and
-  # their `if:` conditions are those of ci.yml; the reasons are there.
+  # The only job that runs the shipped runtime on Windows. Each unit has its reason in the
+  # script of the unit (`.github/smoke-windows/` of the source).
   smoke-windows:
     name: smoke-windows
     needs: resolve
     runs-on: windows-latest
     timeout-minutes: 90
+    # Row TC1: the abilities of the image, the same value as the windows leg of `backend`.
+    env:
+      PRENDERS_ABILITIES: junction,case-insensitive-volume
     defaults:
       run:
         shell: powershell
@@ -305,10 +476,9 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
-        # of the app repository, and as ci.yml there.
+        # The Bun of the build: the workflow env BUN_VERSION.
         with:
-          bun-version: "1.4.0"
+          bun-version: ${{ env.BUN_VERSION }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
@@ -353,8 +523,7 @@ jobs:
           .\.github\smoke-windows\assert-api.ps1
           -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST" -LogDir "$env:SMOKE_OUT"
 
-      # The timeout of this step must stay equal to the one of the same step in ci.yml:
-      # `assert-launcher.ps1` checks its own worst case against it.
+      # `assert-launcher.ps1` checks its own worst case against the timeout of this step.
       - name: Unit 4a - launch through real PowerShell and check the argv it delivered
         id: launcher
         if: ${{ !cancelled() && steps.fixture.outcome == 'success' && steps.deps.outcome == 'success' }}
@@ -385,8 +554,8 @@ jobs:
           .\.github\smoke-windows\assert-root-errno.ps1
           -RepoRoot "${{ github.workspace }}" -ManifestPath "$env:SMOKE_MANIFEST" -LogDir "$env:SMOKE_OUT"
 
-      # One day, not the 30 of ci.yml: the artifacts of a successful run are deleted by
-      # `cleanup.yml`, and a failed run is read the same day.
+      # One day: the artifacts of a successful run are deleted by `cleanup.yml`, and a
+      # failed run is read the same day. No job downloads them; a person reads them.
       - name: Upload smoke artefacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -443,10 +612,10 @@ jobs:
       # The source scans of the web tests import `backend/tests/helpers/source-scan.ts` of the
       # app repository, which reads the TypeScript 5 parser of the backend copy by its path, and
       # the web build type-checks them. So this job installs the backend packages too, as the
-      # frontend job of ci.yml there does. The Bun pin is the pin of the backend job.
+      # backend job does. The Bun pin is the workflow env BUN_VERSION.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: "1.4.0"
+          bun-version: ${{ env.BUN_VERSION }}
       - name: Install backend dependencies for the source scans
         id: backend-deps
         working-directory: backend
@@ -466,8 +635,7 @@ jobs:
       # layout (`*.browser.test.tsx`, `manager/web/vitest.browser.config.ts`) run here in
       # Chromium on Linux, so a release does not need the PC for them. They use the setup
       # steps above (the global setup of the browser suite, `test-setup/run-home.ts`, imports
-      # the backend test helpers), so this job is the one owner of the frontend setup, as the
-      # frontend job of ci.yml there. The browser is the headless shell of the installed
+      # the backend test helpers), so this job is the one owner of the frontend setup. The browser is the headless shell of the installed
       # `playwright` package, with the system libraries that it needs. It needs no secret.
       # Both steps name one browser folder (PLAYWRIGHT_BROWSERS_PATH): the browser suite sets
       # HOME to a fixture home (`test-setup/run-home.ts`), so the default cache under the real
@@ -526,8 +694,7 @@ jobs:
         run: pytest tools/tests --tb=short -q
 
   # The Rust tests are a test job, so a Rust test failure shows in the same run as every
-  # other test failure (OD7 of the process rework, round 3). In ci.yml of the source they
-  # run inside `bundle`. The build of `tauri.conf.json` needs the sidecar
+  # other test failure (OD7 of the process rework, round 3). The build of `tauri.conf.json` needs the sidecar
   # (`binaries/chatman`) and the web build (`../manager/web/dist`), so this job makes both
   # with the steps of `bundle`. No secret except the read-only source key.
   rust:
@@ -560,10 +727,9 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
-        # of the app repository, and as ci.yml there.
+        # The Bun of the build: the workflow env BUN_VERSION.
         with:
-          bun-version: "1.4.0"
+          bun-version: ${{ env.BUN_VERSION }}
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -602,8 +768,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
 
   # The Android JVM tests are a test job, so an Android test failure shows in the same run
-  # as every other test failure (OD7 of the process rework, round 3). In ci.yml of the
-  # source they run inside `android`. The setup is the setup of `android`; the reasons of
+  # as every other test failure (OD7 of the process rework, round 3). The setup is the setup of `android`; the reasons of
   # each step are there.
   android-test:
     name: android-test
@@ -636,10 +801,9 @@ jobs:
           java-version: '17'
       # Row REL2-4: the Gradle task `checkRunDataSafety` runs before the JVM tests with Bun.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
-        # of the app repository, and as ci.yml there.
+        # The Bun of the build: the workflow env BUN_VERSION.
         with:
-          bun-version: "1.4.0"
+          bun-version: ${{ env.BUN_VERSION }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
@@ -681,17 +845,19 @@ jobs:
           line=$(node scripts/junit-count.mjs)
           printf '%s\n' "$line" | tee -a "$GITHUB_STEP_SUMMARY"
           printf 'jvm_tests=%s\n' "$line" >> "$GITHUB_OUTPUT"
+      # Review AN-17: each Kotlin test of the list ran, found by its test class file.
+      - name: Each Kotlin test of the list ran
+        run: node scripts/check-android-test-list.mjs
 
   # Build only: tauri-action gets no `tagName` and no `releaseId`, so it makes no
   # release-API call. The release is made by `publish`, once, after every check.
   # CHATMAN_RELEASE_REPO is THIS repository, because the releases are here.
   # The package jobs (`bundle`, `android`, `android-sign`) start only after every test job
-  # passed (backlog 2026-11-04, row 12). This is different from ci.yml of the source,
-  # where they start after `resolve` only. The step "Each package job needs every test
-  # job" of `actionlint` keeps this order.
+  # passed (backlog 2026-11-04, row 12). The step "Each package job needs every test
+  # job" of `workflow-guards` keeps this order.
   bundle:
     name: bundle (${{ matrix.triple }})
-    needs: [resolve, actionlint, backend, smoke-windows, frontend, python, rust, android-test]
+    needs: [resolve, workflow-guards, static-rules, backend, smoke-windows, frontend, python, rust, android-test]
     runs-on: ${{ matrix.os }}
     # Next-batch plan, N11: the GitHub environment `release-signing` holds the seven Apple
     # secrets. Only the macOS legs get it; the Windows leg has an empty name, so no
@@ -740,10 +906,9 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
-        # of the app repository, and as ci.yml there.
+        # The Bun of the build: the workflow env BUN_VERSION.
         with:
-          bun-version: "1.4.0"
+          bun-version: ${{ env.BUN_VERSION }}
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -783,7 +948,7 @@ jobs:
         run: scripts/check-sidecar-starts.sh "src-tauri/binaries/chatman-${{ matrix.triple }}"
       # The keeper (the process that holds a kept run) must start, read its hello, start
       # a child, move one line and end, on each leg, the Windows leg too. Its child is the
-      # script itself in an echo mode, run by the Bun of this job. The same step is in ci.yml.
+      # script itself in an echo mode, run by the Bun of this job.
       - name: The built keeper starts
         shell: bash
         run: bun scripts/check-keeper-starts.ts "src-tauri/binaries/chatman-keeper-${{ matrix.triple }}${{ runner.os == 'Windows' && '.exe' || '' }}"
@@ -970,7 +1135,7 @@ jobs:
   # `android-sign`, on another runner.
   android:
     name: android
-    needs: [resolve, actionlint, backend, smoke-windows, frontend, python, rust, android-test]
+    needs: [resolve, workflow-guards, static-rules, backend, smoke-windows, frontend, python, rust, android-test]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -998,10 +1163,9 @@ jobs:
       # JVM tests, which also need Bun (row REL2-4, `checkRunDataSafety`), run in
       # `android-test`.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the same pin as BUN_PIN in backend/scripts/build-sidecar.ts
-        # of the app repository, and as ci.yml there.
+        # The Bun of the build: the workflow env BUN_VERSION.
         with:
-          bun-version: "1.4.0"
+          bun-version: ${{ env.BUN_VERSION }}
       # Plan-r3 2.2 item 1 (K4): the APK holds the phone page of the web build of this commit.
       # Gradle task `copyPhonePage` copies it from `manager/web/dist` and stops when the
       # identity of that build is not the identity of the APK.
@@ -1114,7 +1278,7 @@ jobs:
   # failed job does not skip this job; the first step names it and refuses.
   publish:
     name: publish
-    needs: [resolve, actionlint, backend, smoke-windows, frontend, python, rust, android-test, bundle, android, android-sign]
+    needs: [resolve, workflow-guards, static-rules, backend, smoke-windows, frontend, python, rust, android-test, bundle, android, android-sign]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
