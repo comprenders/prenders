@@ -1148,6 +1148,7 @@ jobs:
             scripts/release-notes.mjs
             scripts/updater-manifest.mjs
             release-notes/
+            test-vectors/release-body-marks.json
           sparse-checkout-cone-mode: false
       - name: Refuse if any job did not succeed
         env:
