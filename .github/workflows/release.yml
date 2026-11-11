@@ -391,6 +391,16 @@ jobs:
           persist-credentials: false
       - name: Install the pinned Opengrep
         run: bash source/scripts/install-opengrep.sh
+      # Row WS8e: the scan of the source also runs stylelint of `manager/web`
+      # (`stylelint.config.mjs`), so the job installs the web packages.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: source/manager/web/package-lock.json
+      - name: Install the web packages for stylelint
+        working-directory: source/manager/web
+        run: npm ci
       - name: The rules and the scan of the source
         run: bash source/scripts/static-rules.sh
       - name: The workflow rules on this release workflow
