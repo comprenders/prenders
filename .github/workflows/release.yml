@@ -417,15 +417,16 @@ jobs:
         os: [ubuntu-latest, macos-15, windows-latest]
         # Row TC1: the abilities of each runner image (`backend/tests/helpers/platform-fs.ts`
         # of the source). The global setup of the tests stops the run when a probe
-        # disagrees. The values are facts of the images; the draft run of row RL1b
-        # confirms them.
+        # disagrees. The values are facts of the images. Fix round 2, row R2-8: the draft run
+        # of row RL1b found that the windows image can make a symlink, so its leg declares
+        # `symlink`; the job `smoke-windows` declares the same value.
         include:
           - os: ubuntu-latest
             abilities: symlink,deny-dir-access
           - os: macos-15
             abilities: symlink,deny-dir-access,case-insensitive-volume
           - os: windows-latest
-            abilities: junction,case-insensitive-volume
+            abilities: symlink,junction,case-insensitive-volume
     env:
       PRENDERS_ABILITIES: ${{ matrix.abilities }}
     steps:
@@ -466,9 +467,10 @@ jobs:
     needs: resolve
     runs-on: windows-latest
     timeout-minutes: 90
-    # Row TC1: the abilities of the image, the same value as the windows leg of `backend`.
+    # Row TC1: the abilities of the image, the same value as the windows leg of `backend`
+    # (row R2-8: with `symlink`).
     env:
-      PRENDERS_ABILITIES: junction,case-insensitive-volume
+      PRENDERS_ABILITIES: symlink,junction,case-insensitive-volume
     defaults:
       run:
         shell: powershell
