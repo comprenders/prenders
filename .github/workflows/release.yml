@@ -340,6 +340,8 @@ jobs:
       # Build review A1: this run holds the signing secrets and the write token, so every
       # action of every workflow of this repository is named by a commit hash, which cannot
       # move. A tag such as `@v4` can move. The comment after the hash names the tag.
+      # One action has one hash in all workflows, so a change of the version of an action is
+      # one change in each file.
       - name: Every action is pinned by a commit hash
         run: |
           set -euo pipefail
@@ -348,6 +350,17 @@ jobs:
           if [ -n "$unpinned" ]; then
             echo "These uses: lines name an action by a tag and not by a commit hash:" >&2
             echo "$unpinned" >&2
+            exit 1
+          fi
+          pinned=$(grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$)' .github/workflows/*.yml || true)
+          names=$(printf '%s\n' "$pinned" \
+            | sed -nE 's/.*uses:[[:space:]]*([^@[:space:]]+)@([0-9a-f]{40}).*/\1 \2/p' \
+            | sort -u | awk '{ n[$1]++ } END { for (a in n) if (n[a] > 1) print a }')
+          if [ -n "$names" ]; then
+            echo "These actions are pinned by more than one commit hash; use one hash for each action:" >&2
+            for name in $names; do
+              printf '%s\n' "$pinned" | grep -F "uses: ${name}@" >&2 || true
+            done
             exit 1
           fi
       - name: Lint every workflow file
