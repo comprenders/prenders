@@ -61,6 +61,9 @@ permissions:
 # `BUN_PIN` of `backend/scripts/build-sidecar.ts` of the source.
 env:
   BUN_VERSION: "1.4.0"
+  # The one Gradle version of the Android jobs (the Opengrep rule
+  # `release-gradle-version-from-env` of the source refuses a literal version).
+  GRADLE_VERSION: "9.6.1"
 
 # Two runs for one tag could each find no release and each create one. The second run
 # waits for the first.
@@ -823,16 +826,10 @@ jobs:
         run: npm run build
       - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
         with:
-          gradle-version: 9.6.1
+          gradle-version: ${{ env.GRADLE_VERSION }}
+      # Design-04 W8 note 2026-11-11, point 2: the one owner of the SDK check is in the source.
       - name: Require the SDK packages
-        run: |
-          set -euo pipefail
-          for need in "build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2" "platforms/${ANDROID_PLATFORM}/android.jar"; do
-            if [ ! -f "${ANDROID_HOME}/${need}" ]; then
-              echo "android-test: ${ANDROID_HOME}/${need} is not on this runner image; the job installs no SDK package" >&2
-              exit 1
-            fi
-          done
+        run: bash scripts/require-android-sdk.sh android-test
       - name: Test the Android app
         run: gradle -p android testDebugUnitTest
       # Next-batch plan, N9: `cleanup.yml` deletes the log of a green run, so the count goes
@@ -1190,16 +1187,10 @@ jobs:
         run: npm run build
       - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
         with:
-          gradle-version: 9.6.1
+          gradle-version: ${{ env.GRADLE_VERSION }}
+      # Design-04 W8 note 2026-11-11, point 2: the one owner of the SDK check is in the source.
       - name: Require the SDK packages
-        run: |
-          set -euo pipefail
-          for need in "build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2" "platforms/${ANDROID_PLATFORM}/android.jar"; do
-            if [ ! -f "${ANDROID_HOME}/${need}" ]; then
-              echo "android: ${ANDROID_HOME}/${need} is not on this runner image; the job installs no SDK package" >&2
-              exit 1
-            fi
-          done
+        run: bash scripts/require-android-sdk.sh android
       # The JVM tests and their count run in the test job `android-test`, not here (OD7 of
       # the process rework).
       - name: Build the unsigned release APK
