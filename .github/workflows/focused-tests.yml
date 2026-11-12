@@ -1,0 +1,129 @@
+name: focused-tests
+
+# Owner decision TR-1 = A for fix round 4 of plan next-2026-11-08 (2026-11-12): during a fix
+# round, the developer runs ONLY the failing test files of the round off the laptop, to confirm
+# a cause before the fix. The full test set still runs one time, in `release.yml`. This
+# workflow runs the named files of one suite at one commit of master, and nothing else. It
+# builds nothing and publishes nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: A commit of master of the source repository
+        required: true
+        type: string
+      suite:
+        description: backend, frontend, browser or android
+        required: true
+        type: choice
+        options: [backend, frontend, browser, android]
+      os:
+        description: The runner (backend only)
+        required: false
+        default: ubuntu-latest
+        type: choice
+        options: [ubuntu-latest, windows-latest, macos-15]
+      files:
+        description: The test files or filters, separated by spaces (empty for android)
+        required: false
+        default: ""
+        type: string
+
+run-name: focused ${{ inputs.suite }} ${{ inputs.os }} ${{ inputs.ref }}
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: "1.4.0"
+  GRADLE_VERSION: "9.6.1"
+
+jobs:
+  run:
+    runs-on: ${{ inputs.suite == 'backend' && inputs.os || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    env:
+      PRENDERS_ABILITIES: ${{ inputs.os == 'windows-latest' && 'symlink,junction,case-insensitive-volume' || inputs.os == 'macos-15' && 'symlink,deny-dir-access,case-insensitive-volume' || 'symlink,deny-dir-access' }}
+      FILES: ${{ inputs.files }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Switch to the commit and require it on master
+        shell: bash
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse --verify "${REF}^{commit}")
+          git merge-base --is-ancestor "$sha" origin/master
+          git switch --quiet --detach "$sha"
+      - name: Write the dev build identity
+        shell: bash
+        run: node scripts/build-identity.mjs --write
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install backend dependencies
+        working-directory: backend
+        run: bun install --frozen-lockfile
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: ${{ inputs.suite != 'backend' }}
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: manager/web/package-lock.json
+      - name: Install frontend dependencies
+        if: ${{ inputs.suite != 'backend' }}
+        working-directory: manager/web
+        run: npm ci
+      - name: Test backend files
+        if: ${{ inputs.suite == 'backend' }}
+        shell: bash
+        working-directory: backend
+        run: |
+          read -ra files <<< "$FILES"
+          bun run test -- "${files[@]}"
+      - name: Test frontend files
+        if: ${{ inputs.suite == 'frontend' }}
+        working-directory: manager/web
+        run: |
+          read -ra files <<< "$FILES"
+          npm test -- "${files[@]}"
+      - name: Install the browser of the layout tests
+        if: ${{ inputs.suite == 'browser' }}
+        working-directory: manager/web
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+        run: npx playwright install --with-deps --only-shell chromium
+      - name: Test browser files
+        if: ${{ inputs.suite == 'browser' }}
+        working-directory: manager/web
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+        run: |
+          read -ra files <<< "$FILES"
+          npm run test:browser -- "${files[@]}"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        if: ${{ inputs.suite == 'android' }}
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build frontend for the APK
+        if: ${{ inputs.suite == 'android' }}
+        working-directory: manager/web
+        run: npm run build
+      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
+        if: ${{ inputs.suite == 'android' }}
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+      - name: Require the SDK packages
+        if: ${{ inputs.suite == 'android' }}
+        run: bash scripts/require-android-sdk.sh android-test
+      - name: Test the Android app
+        if: ${{ inputs.suite == 'android' }}
+        run: gradle -p android testDebugUnitTest
