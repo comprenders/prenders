@@ -46,6 +46,9 @@ jobs:
     env:
       PRENDERS_ABILITIES: ${{ inputs.os == 'windows-latest' && 'symlink,junction,case-insensitive-volume' || inputs.os == 'macos-15' && 'symlink,deny-dir-access,case-insensitive-volume' || 'symlink,deny-dir-access' }}
       FILES: ${{ inputs.files }}
+      # The same values as the jobs `android-test` and `android` of release.yml.
+      ANDROID_BUILD_TOOLS_VERSION: 36.0.0
+      ANDROID_PLATFORM: android-36
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
