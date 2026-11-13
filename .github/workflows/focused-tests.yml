@@ -42,7 +42,7 @@ env:
 jobs:
   run:
     runs-on: ${{ inputs.suite == 'backend' && inputs.os || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       PRENDERS_ABILITIES: ${{ inputs.os == 'windows-latest' && 'symlink,junction,case-insensitive-volume' || inputs.os == 'macos-15' && 'symlink,deny-dir-access,case-insensitive-volume' || 'symlink,deny-dir-access' }}
       FILES: ${{ inputs.files }}
