@@ -16,8 +16,10 @@ permissions:
 jobs:
   # A failed run keeps its logs, so the cause can be read; the person who reads them deletes
   # them by hand afterwards (`gh api -X DELETE repos/<repo>/actions/runs/<id>/logs`).
+  # A run with a re-run keeps its logs too: a success after a re-run has failed attempts, and
+  # their logs give the cause of the failure (web test rework, design 6 section 14).
   delete:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt == 1 }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
