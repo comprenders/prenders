@@ -56,11 +56,11 @@ run-name: release ${{ inputs.tag }}${{ inputs.draft && ' (draft)' || '' }}
 permissions:
   contents: read
 
-# The one Bun pin of the workflow. Every setup-bun step names it (the Opengrep rule
-# `release-bun-pin-from-env` of the source), and the job `workflow-guards` compares it with
-# `BUN_PIN` of `backend/scripts/build-sidecar.ts` of the source.
+# The Node and the Bun of every job are the files `.node-version` and `.bun-version` of the
+# source, the one owner of each version (the Opengrep rule `release-versions-from-files` of
+# the source refuses a version in this file). The job `workflow-guards` compares
+# `.bun-version` with `BUN_PIN` of `backend/scripts/build-sidecar.ts` of the source.
 env:
-  BUN_VERSION: "1.4.0"
   # The one Gradle version of the Android jobs (the Opengrep rule
   # `release-gradle-version-from-env` of the source refuses a literal version).
   GRADLE_VERSION: "9.6.1"
@@ -138,8 +138,18 @@ jobs:
           identity=$(node scripts/build-identity.mjs --print --commit "$SHA" --tag "$TAG")
           echo "identity=${identity}" >> "$GITHUB_OUTPUT"
           echo "release: the build identity is ${identity}"
-      # No tracked file holds the number of the tag, and the script works (plan-r3 7.1).
-      - name: Test the build identity and that no file holds the version
+      # The release gate of the source (`scripts/release-checks.mjs`), the same checks that
+      # `scripts/release.sh` runs before the tag: no tracked file holds a number of the release
+      # line of the tag (plan-r3 7.1), and no file holds the old name (rename plan section 9).
+      # Each check runs also when the one before it failed, so the run shows every fault.
+      - name: No file holds the version
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' }}
+        run: node scripts/release-checks-cli.mjs versions
+      - name: No file holds the old name
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' }}
+        run: node scripts/release-checks-cli.mjs old-name
+      - name: Test the release scripts
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' }}
         run: node --test scripts/tests/*.test.mjs
 
   # The guards of the workflow files of this repository (base design-02 3.1 of the cleanup
@@ -165,8 +175,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      # The source at the tag commit, in `source/`: the Bun pin step imports `BUN_PIN`, and
-      # the script path step looks for each path that a job names.
+      # The source at the tag commit, in `source/`: the Bun pin step imports `BUN_PIN` and reads
+      # `.bun-version`, and the script path step looks for each path that a job names.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ secrets.SOURCE_REPO }}
@@ -176,26 +186,31 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version-file: source/.bun-version
       - name: Install backend dependencies for the Bun pin step
         working-directory: source/backend
         run: bun install --frozen-lockfile
       # `build-sidecar.ts` refuses a Bun that is not BUN_PIN, so a release with two pins
       # fails late, in `bundle`. This step fails at the start. Plain `node -e` cannot
       # import a `.ts` file; `bun -e` can. The import runs no build: the script builds only
-      # under `import.meta.main`.
-      - name: The workflow Bun pin is BUN_PIN of the source
+      # under `import.meta.main`. setup-bun takes a version from `package.json` or the
+      # newest Bun when it cannot read the version file, so this step also compares the
+      # Bun that runs it.
+      - name: The Bun pin of the source is BUN_PIN of the source
         env:
           SIDECAR: ${{ github.workspace }}/source/backend/scripts/build-sidecar.ts
+          PIN_FILE: ${{ github.workspace }}/source/.bun-version
         run: |
           set -euo pipefail
           bun -e '
+            const { readFileSync } = await import("node:fs");
             const { BUN_PIN } = await import(process.env.SIDECAR);
-            if (BUN_PIN !== process.env.BUN_VERSION) {
-              console.error("release: the workflow env BUN_VERSION is " + process.env.BUN_VERSION + ", BUN_PIN of the sidecar build script is " + BUN_PIN);
+            const pin = readFileSync(process.env.PIN_FILE, "utf8").trim();
+            if (BUN_PIN !== pin || Bun.version !== pin) {
+              console.error("release: the file .bun-version is " + pin + ", BUN_PIN of the sidecar build script is " + BUN_PIN + ", and the Bun of this job is " + Bun.version);
               process.exit(1);
             }
-            console.log("release: BUN_VERSION and BUN_PIN are " + BUN_PIN);
+            console.log("release: .bun-version, BUN_PIN and the Bun of this job are " + BUN_PIN);
           '
       - name: Install actionlint
         run: |
@@ -233,21 +248,25 @@ jobs:
       # A `needs:` that is not direct counts (android-sign needs android, which needs the
       # tests). `publish` must need every other job, because its first step checks only
       # the jobs that it needs.
+      # RECORD_JOBS (`slowest`) only read the time records of the test jobs: they are not test
+      # jobs, and neither a package job nor `publish` waits for them.
       - name: Each package job needs every test job
         env:
           PACKAGE_JOBS: '["bundle", "android", "android-sign"]'
+          RECORD_JOBS: '["slowest"]'
         run: |
           set -euo pipefail
           faults=$("${RUNNER_TEMP}/yq" -o=json '.jobs' .github/workflows/release.yml \
-            | jq -r --argjson packages "$PACKAGE_JOBS" '
+            | jq -r --argjson packages "$PACKAGE_JOBS" --argjson records "$RECORD_JOBS" '
                 def needs($job): (.[$job].needs // []) | if type == "string" then [.] else . end;
                 def closure($job): [needs($job)[] as $n | $n, closure($n)[]] | unique;
                 (keys) as $all
-                | ($all - $packages - ["publish"]) as $tests
+                | ($all - $packages - $records - ["publish"]) as $tests
                 | ($packages - $all | .[] | "the package job \(.) is not in the file"),
                   ($packages[] as $p | select($p | IN($all[]))
                     | $tests - closure($p) | .[] | "the package job \($p) does not need the test job \(.)"),
-                  ($all - ["publish"] - needs("publish") | .[] | "the job publish does not need the job \(.)")')
+                  ($records - $all | .[] | "the record job \(.) is not in the file"),
+                  ($all - ["publish"] - $records - needs("publish") | .[] | "the job publish does not need the job \(.)")')
           if [ -n "$faults" ]; then
             echo "$faults" >&2
             exit 1
@@ -284,6 +303,8 @@ jobs:
       # path of a job that checks out the source into a folder (`path:`) is read inside
       # that folder; any other path of such a job is a path of this repository. A job with
       # a script that is not in its checkout fails late, after its setup (review RC-7).
+      # The version file of each setup-bun and setup-node step is a path of the job too:
+      # setup-bun takes another Bun, with only a warning, when it cannot read the file.
       - name: Each script path that a job runs is in the checkout of the job
         run: |
           set -euo pipefail
@@ -295,11 +316,12 @@ jobs:
                 | (if $src == null then null else ($src.with.path // "") end) as $root
                 | (if $src == null or ($src.with["sparse-checkout"] // null) == null then null
                    else [$src.with["sparse-checkout"] | split("\n")[] | select(length > 0)] end) as $sparse
-                | $steps[] | select(.run != null)
-                | (.["working-directory"] // "") as $wd
-                | .run | gsub("\\\\"; "/")
-                | [scan("(?:^|[\\s\"'"'"'=])(?:\\./)?([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\\.(?:mjs|cjs|js|ts|sh|ps1|py))(?=$|[\\s\"'"'"';)])")[0]] | unique[]
-                | (if $wd == "" then . else $wd + "/" + . end) as $path
+                | (($steps[] | select(.run != null)
+                    | (.["working-directory"] // "") as $wd
+                    | .run | gsub("\\\\"; "/")
+                    | [scan("(?:^|[\\s\"'"'"'=])(?:\\./)?([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\\.(?:mjs|cjs|js|ts|sh|ps1|py))(?=$|[\\s\"'"'"';)])")[0]] | unique[]
+                    | (if $wd == "" then . else $wd + "/" + . end)),
+                   ($steps[] | (.with // {}) | (.["bun-version-file"], .["node-version-file"]) | select(. != null))) as $path
                 | if $root == null or ($root != "" and ($path | startswith($root + "/") | not)) then
                     "\($job)\tthis\t\($path)\t"
                   else
@@ -395,7 +417,7 @@ jobs:
       # (`stylelint.config.mjs`), so the job installs the web packages.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: source/.node-version
           cache: npm
           cache-dependency-path: source/manager/web/package-lock.json
       - name: Install the web packages for stylelint
@@ -442,9 +464,9 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the workflow env BUN_VERSION.
+        # The Bun of the build: the file .bun-version of the source.
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version-file: .bun-version
       # Each check runs when its setup passed, so a type error does not hide a test failure
       # (OD7 of the process rework, round 3). The form of `smoke-windows`.
       - name: Install backend dependencies
@@ -455,10 +477,19 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         working-directory: backend
         run: bun run typecheck
+      # The reporter `record-reporter.mjs` writes the time of each case and file (testing.md 2a).
       - name: Test backend
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         working-directory: backend
-        run: bun run test
+        run: bun run test -- --reporter=default --reporter=../scripts/record-reporter.mjs --outputFile.json=${{ runner.temp }}/record/be-${{ matrix.os }}.json
+      # The time record of the job, for the job `slowest` (testing.md 2a).
+      - name: Upload the time record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: record-backend-${{ matrix.os }}
+          path: ${{ runner.temp }}/record/
+          retention-days: 1
 
   # The only job that runs the shipped runtime on Windows. Each unit has its reason in the
   # script of the unit (`.github/smoke-windows/` of the source).
@@ -504,12 +535,12 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the workflow env BUN_VERSION.
+        # The Bun of the build: the file .bun-version of the source.
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version-file: .bun-version
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: .node-version
       - name: Install backend dependencies
         id: deps
         working-directory: backend
@@ -630,7 +661,7 @@ jobs:
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: manager/web/package-lock.json
       - name: Install frontend dependencies
@@ -640,10 +671,10 @@ jobs:
       # The source scans of the web tests import `backend/tests/helpers/source-scan.ts` of the
       # app repository, which reads the TypeScript 5 parser of the backend copy by its path, and
       # the web build type-checks them. So this job installs the backend packages too, as the
-      # backend job does. The Bun pin is the workflow env BUN_VERSION.
+      # backend job does. The Bun pin is the file .bun-version of the source.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version-file: .bun-version
       - name: Install backend dependencies for the source scans
         id: backend-deps
         working-directory: backend
@@ -658,7 +689,7 @@ jobs:
       - name: Test frontend
         if: ${{ !cancelled() && steps.web-deps.outcome == 'success' && steps.backend-deps.outcome == 'success' }}
         working-directory: manager/web
-        run: npm test
+        run: npm test -- --reporter=default --reporter=../../scripts/record-reporter.mjs --outputFile.json=${{ runner.temp }}/record/web.json
       # Backlog 2026-11-04 reader-voice, rows 48 and 59: the tests that see the real phone
       # layout (`*.browser.test.tsx`, `manager/web/vitest.browser.config.ts`) run here in
       # Chromium on Linux, so a release does not need the PC for them. They use the setup
@@ -680,11 +711,19 @@ jobs:
         working-directory: manager/web
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
-        run: npm run test:browser
+        run: npm run test:browser -- --reporter=default --reporter=../../scripts/record-reporter.mjs --outputFile.json=${{ runner.temp }}/record/web-browser.json
       - name: Audit frontend dependencies
         if: ${{ !cancelled() && steps.identity.outcome == 'success' }}
         working-directory: manager/web
         run: npm audit --audit-level=high
+      # The time record of the job, for the job `slowest` (testing.md 2a).
+      - name: Upload the time record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: record-frontend
+          path: ${{ runner.temp }}/record/
+          retention-days: 1
 
   python:
     name: python (${{ matrix.python-version }})
@@ -717,9 +756,18 @@ jobs:
       - name: Type-check
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pyright tools
+      # The JUnit file holds the time of each case (testing.md 2a).
       - name: Test
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: pytest tools/tests --tb=short -q
+        run: pytest tools/tests --tb=short -q --junitxml=${{ runner.temp }}/record/python-${{ matrix.python-version }}.junit/report.xml
+      # The time record of the job, for the job `slowest` (testing.md 2a).
+      - name: Upload the time record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: record-python-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/record/
+          retention-days: 1
 
   # The Rust tests are a test job, so a Rust test failure shows in the same run as every
   # other test failure (OD7 of the process rework, round 3). The build of `tauri.conf.json` needs the sidecar
@@ -755,9 +803,9 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the workflow env BUN_VERSION.
+        # The Bun of the build: the file .bun-version of the source.
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version-file: .bun-version
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -769,7 +817,7 @@ jobs:
         run: bun run build:sidecar:${{ matrix.triple }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: manager/web/package-lock.json
       - name: Install frontend dependencies
@@ -792,8 +840,33 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
+      # cargo test on stable Rust gives no time for each case, so the record of this job holds
+      # the time of the test step only (testing.md 2a).
+      - name: Note the start of the Rust tests
+        shell: bash
+        run: echo "RUST_TEST_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Test Rust
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Write the time of the Rust tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const dir = process.env.RUNNER_TEMP + "/record";
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(dir + "/rust-" + process.env.TRIPLE + ".seconds", String(Math.round(Date.now() / 1000) - Number(process.env.RUST_TEST_START)));
+          '
+      # The time record of the job, for the job `slowest` (testing.md 2a).
+      - name: Upload the time record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: record-rust-${{ matrix.triple }}
+          path: ${{ runner.temp }}/record/
+          retention-days: 1
 
   # The Android JVM tests are a test job, so an Android test failure shows in the same run
   # as every other test failure (OD7 of the process rework, round 3). The setup is the setup of `android`; the reasons of
@@ -829,12 +902,12 @@ jobs:
           java-version: '17'
       # Row REL2-4: the Gradle task `checkRunDataSafety` runs before the JVM tests with Bun.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the workflow env BUN_VERSION.
+        # The Bun of the build: the file .bun-version of the source.
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version-file: .bun-version
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: manager/web/package-lock.json
       - name: Install frontend dependencies
@@ -870,6 +943,24 @@ jobs:
       # Review AN-17: each Kotlin test of the list ran, found by its test class file.
       - name: Each Kotlin test of the list ran
         run: node scripts/check-android-test-list.mjs
+      # The JUnit files of Gradle hold the time of each case (testing.md 2a).
+      - name: Copy the JUnit files into the time record
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          results=android/app/build/test-results/testDebugUnitTest
+          mkdir -p "${RUNNER_TEMP}/record/android.junit"
+          if [ -d "$results" ]; then
+            find "$results" -maxdepth 1 -name '*.xml' -exec cp {} "${RUNNER_TEMP}/record/android.junit/" \;
+          fi
+      # The time record of the job, for the job `slowest` (testing.md 2a).
+      - name: Upload the time record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: record-android-test
+          path: ${{ runner.temp }}/record/
+          retention-days: 1
 
   # Build only: tauri-action gets no `tagName` and no `releaseId`, so it makes no
   # release-API call. The release is made by `publish`, once, after every check.
@@ -928,9 +1019,9 @@ jobs:
           IDENTITY: ${{ needs.resolve.outputs.identity }}
         run: node scripts/build-identity.mjs --from "$IDENTITY"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the workflow env BUN_VERSION.
+        # The Bun of the build: the file .bun-version of the source.
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version-file: .bun-version
       - name: Install backend dependencies
         working-directory: backend
         run: bun install --frozen-lockfile
@@ -976,7 +1067,7 @@ jobs:
         run: bun scripts/check-keeper-starts.ts "src-tauri/binaries/chatman-keeper-${{ matrix.triple }}${{ runner.os == 'Windows' && '.exe' || '' }}"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: manager/web/package-lock.json
       - name: Install frontend dependencies
@@ -1185,15 +1276,15 @@ jobs:
       # JVM tests, which also need Bun (row REL2-4, `checkRunDataSafety`), run in
       # `android-test`.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        # The Bun of the build: the workflow env BUN_VERSION.
+        # The Bun of the build: the file .bun-version of the source.
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version-file: .bun-version
       # Plan-r3 2.2 item 1 (K4): the APK holds the phone page of the web build of this commit.
       # Gradle task `copyPhonePage` copies it from `manager/web/dist` and stops when the
       # identity of that build is not the identity of the APK.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: manager/web/package-lock.json
       - name: Install frontend dependencies
@@ -1254,6 +1345,9 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             android/release-cert.sha256
+            backend/src/shared/version-grammar.mjs
+            scripts/apk-checks-cli.mjs
+            scripts/apk-checks.mjs
             scripts/release-names-cli.mjs
             scripts/release-names.mjs
             scripts/sign-apk.sh
@@ -1290,6 +1384,82 @@ jobs:
           if-no-files-found: error
           retention-days: 2
 
+  # The slowest list of the run (testing.md 2a): the 20 slowest cases and the 5 slowest files
+  # of each test job, and each case over 1 s, in one file. The file names test files and
+  # cases of the source, which is not public, so the job seals it: a new random key encrypts
+  # the file, and the public key `.github/slowest-record.pub.pem` of this repository encrypts
+  # the random key. The private key is on the lead Mac only, out of every repository. The
+  # artifact `slowest-<run id>` stays after `cleanup.yml` (it keeps `slowest-*`), and the lead
+  # opens it with `scripts/open-slowest.sh <run id> <key file>` of the source. `!cancelled()`:
+  # the list is written also when a test job failed. No package job and not `publish` waits
+  # for this job (RECORD_JOBS of `workflow-guards`).
+  slowest:
+    name: slowest
+    needs: [resolve, backend, frontend, python, rust, android-test]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/slowest-record.pub.pem
+          sparse-checkout-cone-mode: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: source
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/check-android-test-list.mjs
+            scripts/record-summary.mjs
+          sparse-checkout-cone-mode: false
+      # One folder for each time record artifact (no `merge-multiple`), so the list has one
+      # part for each test job and each leg of a job.
+      - name: Download the time records
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: record-*
+          path: ${{ runner.temp }}/records
+      - name: Write and seal the slowest list
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          list="${RUNNER_TEMP}/slowest.txt"
+          key="${RUNNER_TEMP}/slowest.key"
+          sealed="${RUNNER_TEMP}/slowest"
+          mkdir -p "$sealed"
+          : > "$list"
+          parts=0
+          for dir in "${RUNNER_TEMP}"/records/record-*/; do
+            name=$(basename "$dir")
+            {
+              printf '## %s\n\n' "${name#record-}"
+              node source/scripts/record-summary.mjs "$dir"
+              printf '\n'
+            } >> "$list"
+            parts=$((parts + 1))
+          done
+          openssl rand -hex 32 > "$key"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -salt \
+            -in "$list" -out "${sealed}/slowest.txt.enc" -pass "file:${key}"
+          openssl pkeyutl -encrypt -pubin -inkey .github/slowest-record.pub.pem \
+            -pkeyopt rsa_padding_mode:oaep -in "$key" -out "${sealed}/key.enc"
+          rm -f "$key" "$list"
+          echo "release: the slowest list of ${parts} time records is sealed"
+      - name: Upload the sealed slowest list
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: slowest-${{ github.run_id }}
+          path: ${{ runner.temp }}/slowest/
+          if-no-files-found: error
+          retention-days: 90
+
   # The release is made here and nowhere else, after every other job. `!cancelled()`: a
   # failed job does not skip this job; the first step names it and refuses.
   publish:
@@ -1322,6 +1492,8 @@ jobs:
           sparse-checkout: |
             scripts/check-release-set.sh
             scripts/android-release-notes.sh
+            scripts/publish-checks-cli.mjs
+            scripts/publish-checks.mjs
             scripts/publish-release.sh
             scripts/release-names-cli.mjs
             scripts/release-names.mjs

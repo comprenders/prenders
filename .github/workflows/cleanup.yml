@@ -3,7 +3,9 @@ name: cleanup
 # After each run of `release`, delete the logs and the artifacts of that run.
 # The logs can show lines of the source code (compiler warnings, failed tests), and the source
 # is not public. The artifacts of a `release` run are used by its own `publish` job, so they
-# have no use after the run.
+# have no use after the run. The one exception is the sealed slowest list `slowest-<run id>`
+# (testing.md 2a): the code review of the next round reads it, and only the private key of
+# the lead opens it.
 
 on:
   workflow_run:
@@ -23,15 +25,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Delete the artifacts and the logs of the run
+      - name: Delete the artifacts except the slowest list, and the logs of the run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
-          for id in $(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}/artifacts" --jq '.artifacts[].id'); do
+          for id in $(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}/artifacts" --jq '.artifacts[] | select(.name | startswith("slowest-") | not) | .id'); do
             gh api -X DELETE "repos/${GH_REPO}/actions/artifacts/${id}"
           done
           gh api -X DELETE "repos/${GH_REPO}/actions/runs/${RUN_ID}/logs"
-          echo "cleanup: deleted the artifacts and the logs of run ${RUN_ID}"
+          echo "cleanup: deleted the artifacts (except slowest-*) and the logs of run ${RUN_ID}"
