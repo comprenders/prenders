@@ -458,6 +458,16 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
+      # Row K4-2 of the test foundation plan (DF4-3): `bun run test` runs vitest with
+      # `node`, so the job sets the Node of the version file of the source, before the
+      # build identity step, which runs `node` too.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+      # The value of `.node-version` is a major only, so the patch comes from the cache of
+      # the runner image; this step is the record of the Node of each leg.
+      - name: The Node of the backend tests
+        run: node --version
       - name: Write the build identity of the tag
         shell: bash
         env:
