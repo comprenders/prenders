@@ -21,6 +21,9 @@ name: publish
 # `scripts/publish-release.sh verify release` checks the files of the draft, publishes it with
 # the name `Prenders vX.Y.Z` and checks the published files again. The candidate run checked
 # `latest.json` against the same draft, so this workflow gives no `latest.json`.
+# A second run after a failure that came after the publish of the draft: `promoteAction` gives
+# `verify` for the one public release of the tag with the name `Prenders vX.Y.Z`, and
+# `verify release` then only checks the published release (no publish, no upload).
 #
 # The source is read with the read-only deploy key (secret SOURCE_DEPLOY_KEY) from the
 # repository named in the secret SOURCE_REPO.
@@ -115,7 +118,12 @@ jobs:
           SHA: ${{ steps.sha.outputs.sha }}
         run: |
           set -euo pipefail
-          id=$(bash scripts/publish-release.sh promote "$TAG" "$SHA" .)
-          echo "publish: the draft of ${TAG} (id ${id}) may be published"
+          action=$(bash scripts/publish-release.sh promote "$TAG" "$SHA" .)
+          read -r step id <<< "$action"
+          if [ "$step" = verify ]; then
+            echo "publish: the release of ${TAG} (id ${id}) is public already; the next step only checks it"
+          else
+            echo "publish: the draft of ${TAG} (id ${id}) may be published"
+          fi
       - name: Publish the draft and verify the release carries the complete set
         run: bash scripts/publish-release.sh verify release "$TAG"
