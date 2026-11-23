@@ -1,23 +1,24 @@
 name: release-start
 
-# Start the workflow `release` once for each new release tag of the source repository
-# (owner, 2026-10-09: "any tagged push to the private repo should lead to triggering the
-# release in the public repo").
+# The backup start of the release runs: once for each new release tag of the source
+# repository (owner, 2026-10-09: "any tagged push to the private repo should lead to
+# triggering the release in the public repo").
 #
-# `scripts/release.sh` of the source makes and pushes the tag `v<version>` and starts no
-# run. This workflow runs on a schedule, reads the tags of the source with the read-only
-# deploy key (secret SOURCE_DEPLOY_KEY, repository in the secret SOURCE_REPO), and starts
-# `release.yml` of this repository for each tag that `scripts/release-tags-to-start.mjs`
-# of the source names: a tag v and a version, above the newest published release of this
-# repository, that has no run of `release.yml` yet. So one tag gives one run, also when
-# that run fails (a person starts a failed release again by hand), and an old tag that
-# never had a release starts nothing. An annotated tag with the message `draft` starts a
-# draft release, which publishes nothing.
+# `scripts/release.sh` of the source makes and pushes the tag and starts its run itself. This
+# workflow runs on a schedule, reads the tags of the source with the read-only deploy key
+# (secret SOURCE_DEPLOY_KEY, repository in the secret SOURCE_REPO), and starts a run for each
+# tag that `scripts/release-tags-to-start.mjs` of the source names (release plan 2026-11-22,
+# design V): a candidate tag vX.Y.Z-rcN with the message `draft` starts `release.yml` with
+# `draft=true` (a candidate run), and a final tag vX.Y.Z whose message is its own name starts
+# `publish.yml`. Only a tag above the newest published release of this repository that has no
+# run of its name (`release <tag> (draft)` or `publish <tag>`) starts a run. So one tag gives
+# one run, also when that run fails (a person starts a failed run again by hand), and an old
+# tag that never had a release starts nothing.
 #
 # It needs no new secret: the token of the run reads the releases and the runs of this
-# repository and starts `release.yml` (a start by `workflow_dispatch` is allowed with
-# that token). The private repository runs nothing, because its Actions minutes are used
-# up.
+# repository and starts `release.yml` and `publish.yml` (a start by `workflow_dispatch` is
+# allowed with that token). The private repository runs nothing, because its Actions minutes
+# are used up.
 #
 # A schedule starts late when GitHub is busy, so a release can start some time after the
 # tag push. GitHub stops the schedule of a public repository after 60 days with no
@@ -53,7 +54,7 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Start release.yml for each new release tag
+      - name: Start a run for each new release tag
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -62,17 +63,24 @@ jobs:
           releases=$(mktemp)
           runs=$(mktemp)
           gh api --paginate "repos/${REPO}/releases?per_page=100" --jq '.[] | select(.draft | not) | .tag_name' > "$releases"
-          gh api --paginate "repos/${REPO}/actions/workflows/release.yml/runs?per_page=100" --jq '.workflow_runs[].display_title' > "$runs"
+          # The run names of both workflows go into the one file.
+          for workflow in release.yml publish.yml; do
+            gh api --paginate "repos/${REPO}/actions/workflows/${workflow}/runs?per_page=100" --jq '.workflow_runs[].display_title'
+          done > "$runs"
           start=$(node scripts/release-tags-to-start.mjs --releases "$releases" --runs "$runs")
           if [ -z "$start" ]; then
             echo "release-start: no new release tag"
             exit 0
           fi
           while IFS=$'\t' read -r tag kind; do
-            args=(workflow run release.yml -R "$REPO" -f "tag=${tag}")
-            if [ "$kind" = draft ]; then
-              args+=(-f draft=true)
-            fi
+            case "$kind" in
+              draft) args=(workflow run release.yml -R "$REPO" -f "tag=${tag}" -f draft=true) ;;
+              publish) args=(workflow run publish.yml -R "$REPO" -f "tag=${tag}") ;;
+              *)
+                echo "release-start: the kind \"${kind}\" of ${tag} is not draft or publish" >&2
+                exit 1
+                ;;
+            esac
             echo "release-start: gh ${args[*]}"
             gh "${args[@]}"
           done <<< "$start"

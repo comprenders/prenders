@@ -1,10 +1,18 @@
 name: release
 
-# A release of the app. `scripts/release.sh [--draft] major|minor|patch` of the source
-# repository computes the next version from the last release tag (semantic versioning) and
-# pushes the tag `v<version>` there. The scheduled workflow `release-start.yml` of this
-# repository reads the tags of the source and starts this workflow with each new tag, one
-# run for each tag. A person with write access can also start it by hand.
+# The candidate run of a release of the app (release plan 2026-11-22, design V).
+# `scripts/release.sh major|minor|patch` of the source repository computes the next version
+# X.Y.Z from the last published release (semantic versioning), pushes the candidate tag
+# `vX.Y.Z-rcN` there and starts this workflow with `draft: true`. The scheduled workflow
+# `release-start.yml` of this repository is the backup start: it reads the tags of the source
+# and starts this workflow with each new candidate tag, one run for each tag. A person with
+# write access can also start it by hand.
+#
+# Every run of this workflow is a candidate run: it refuses a final tag and a run with no
+# `draft`. It runs every test, builds the FINAL version X.Y.Z (the build identity of a
+# candidate tag has the final version, `scripts/build-identity.mjs`) and keeps the files as the
+# draft release of the tag vX.Y.Z with the name `Prenders vX.Y.Z-rcN`. The workflow
+# `publish.yml` publishes that draft with no test and no build (`scripts/release.sh publish`).
 #
 # No file of the source holds the version (plan-r3 7.1). `resolve` makes the build identity
 # of the tag (`scripts/build-identity.mjs --print`), and each job that builds or tests
@@ -28,8 +36,8 @@ name: release
 # Every job builds the commit that `resolve` found for the tag, never the tag name, so a
 # tag that moves during the run changes nothing.
 #
-# With `draft: true` the run makes a DRAFT release with the name of the tag. A draft has
-# no git tag and only a person with push access can see it, so nothing is published.
+# The run makes a DRAFT release. A draft has no git tag and only a person with push access
+# can see it, so nothing is published.
 #
 # The logs and the artifacts of a successful run are deleted after the run
 # (`cleanup.yml`).
@@ -42,11 +50,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: A v* tag of the source repository (its commit must be on master)
+        description: A candidate tag vX.Y.Z-rcN of the source repository (its commit must be on master)
         required: true
         type: string
       draft:
-        description: Make a draft release, for a test run (nothing is published)
+        description: Must be true; every run is a candidate run that makes a draft release (nothing is published)
         required: false
         default: false
         type: boolean
@@ -81,6 +89,10 @@ jobs:
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
       identity: ${{ steps.identity.outputs.identity }}
+      # The final tag vX.Y.Z of the files of the run, and the candidate tag of the run. Every
+      # product use of the tag after `resolve` takes `release_tag`.
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      candidate_tag: ${{ steps.identity.outputs.candidate_tag }}
     steps:
       - name: Refuse a tag that is not v and a version
         env:
@@ -120,12 +132,20 @@ jobs:
         env:
           SHA: ${{ steps.sha.outputs.sha }}
         run: git switch --quiet --detach "$SHA"
-      # A release is a final version. The rule is `version-check.mjs` of the tag commit; a
-      # release candidate stops the run here, before any build.
-      - name: Refuse a release candidate
+      # A run of this workflow is a candidate run. The rule is `version-check.mjs` of the tag
+      # commit: a final tag stops the run here, before any build (only `publish.yml`
+      # publishes a final version), and so does a run with no `draft`.
+      - name: Refuse a final tag and a candidate with no draft
         env:
           TAG: ${{ inputs.tag }}
-        run: node scripts/version-check.mjs valid --final "${TAG#v}"
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          node scripts/version-check.mjs valid --candidate "${TAG#v}"
+          if [ "$DRAFT" != true ]; then
+            echo "release: the candidate run of ${TAG} needs draft: true; a run of this workflow never publishes" >&2
+            exit 1
+          fi
       # The tag is in the grammar, points at the commit and is higher than every other
       # release tag that the commit reaches; else the script names the fault and stops.
       - name: Make the build identity of the tag
@@ -138,6 +158,10 @@ jobs:
           identity=$(node scripts/build-identity.mjs --print --commit "$SHA" --tag "$TAG")
           echo "identity=${identity}" >> "$GITHUB_OUTPUT"
           echo "release: the build identity is ${identity}"
+          release_tag="v$(printf '%s' "$identity" | jq -r .version)"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "candidate_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "release: the candidate ${TAG} builds the release ${release_tag}"
       # The release gate of the source (`scripts/release-checks.mjs`), the same checks that
       # `scripts/release.sh` runs before the tag: no tracked file holds a number of the release
       # line of the tag (plan-r3 7.1), and no file holds the old name (rename plan section 9).
@@ -305,29 +329,56 @@ jobs:
       # a script that is not in its checkout fails late, after its setup (review RC-7).
       # The version file of each setup-bun and setup-node step is a path of the job too:
       # setup-bun takes another Bun, with only a warning, when it cannot read the file.
+      # Design V, DR3-2: the step reads this file and `publish.yml`, and each relative import
+      # of each `.mjs` file of a sparse set is in the same set. The import paths come from the
+      # module parse of V8 (`vm.SourceTextModule`, `dependencySpecifiers`), not from a text
+      # search, and are read at the tag commit of the source.
       - name: Each script path that a job runs is in the checkout of the job
         run: |
           set -euo pipefail
-          "${RUNNER_TEMP}/yq" -o=json '.jobs' .github/workflows/release.yml \
-            | jq -r '
-                to_entries[] | .key as $job | (.value.steps // []) as $steps
-                | ([$steps[] | select((.uses // "") | startswith("actions/checkout@"))
-                    | select((.with.repository // "") | test("SOURCE_REPO"))][0] // null) as $src
-                | (if $src == null then null else ($src.with.path // "") end) as $root
-                | (if $src == null or ($src.with["sparse-checkout"] // null) == null then null
-                   else [$src.with["sparse-checkout"] | split("\n")[] | select(length > 0)] end) as $sparse
-                | (($steps[] | select(.run != null)
-                    | (.["working-directory"] // "") as $wd
-                    | .run | gsub("\\\\"; "/")
-                    | [scan("(?:^|[\\s\"'"'"'=])(?:\\./)?([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\\.(?:mjs|cjs|js|ts|sh|ps1|py))(?=$|[\\s\"'"'"';)])")[0]] | unique[]
-                    | (if $wd == "" then . else $wd + "/" + . end)),
-                   ($steps[] | (.with // {}) | (.["bun-version-file"], .["node-version-file"]) | select(. != null))) as $path
-                | if $root == null or ($root != "" and ($path | startswith($root + "/") | not)) then
-                    "\($job)\tthis\t\($path)\t"
-                  else
-                    (if $root == "" then $path else $path[($root | length) + 1:] end) as $rel
-                    | "\($job)\tsource\t\($rel)\t\($sparse // [] | join(" "))"
-                  end' | sort -u > "${RUNNER_TEMP}/script-paths.tsv"
+          workflows=(release.yml publish.yml)
+          for wf in "${workflows[@]}"; do
+            "${RUNNER_TEMP}/yq" -o=json '.jobs' ".github/workflows/${wf}" \
+              | jq -r --arg wf "$wf" '
+                  to_entries[] | ($wf + ":" + .key) as $job | (.value.steps // []) as $steps
+                  | ([$steps[] | select((.uses // "") | startswith("actions/checkout@"))
+                      | select((.with.repository // "") | test("SOURCE_REPO"))][0] // null) as $src
+                  | (if $src == null then null else ($src.with.path // "") end) as $root
+                  | (if $src == null or ($src.with["sparse-checkout"] // null) == null then null
+                     else [$src.with["sparse-checkout"] | split("\n")[] | select(length > 0)] end) as $sparse
+                  | (($steps[] | select(.run != null)
+                      | (.["working-directory"] // "") as $wd
+                      | .run | gsub("\\\\"; "/")
+                      | [scan("(?:^|[\\s\"'"'"'=])(?:\\./)?([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\\.(?:mjs|cjs|js|ts|sh|ps1|py))(?=$|[\\s\"'"'"';)])")[0]] | unique[]
+                      | (if $wd == "" then . else $wd + "/" + . end)),
+                     ($steps[] | (.with // {}) | (.["bun-version-file"], .["node-version-file"]) | select(. != null))) as $path
+                  | if $root == null or ($root != "" and ($path | startswith($root + "/") | not)) then
+                      "\($job)\tthis\t\($path)\t"
+                    else
+                      (if $root == "" then $path else $path[($root | length) + 1:] end) as $rel
+                      | "\($job)\tsource\t\($rel)\t\($sparse // [] | join(" "))"
+                    end'
+          done | sort -u > "${RUNNER_TEMP}/script-paths.tsv"
+          for wf in "${workflows[@]}"; do
+            "${RUNNER_TEMP}/yq" -o=json '.jobs' ".github/workflows/${wf}" \
+              | jq -r --arg wf "$wf" '
+                  to_entries[] | ($wf + ":" + .key) as $job
+                  | ([(.value.steps // [])[] | select((.uses // "") | startswith("actions/checkout@"))
+                      | select((.with.repository // "") | test("SOURCE_REPO"))][0] // null) as $src
+                  | select($src != null and ($src.with["sparse-checkout"] // null) != null)
+                  | "\($job)\t\([$src.with["sparse-checkout"] | split("\n")[] | select(length > 0)] | join(" "))"'
+          done | sort -u > "${RUNNER_TEMP}/sparse-sets.tsv"
+          # 0 when the path is an entry of the sparse set, or is inside a folder entry (`dir/`).
+          in_sparse() {
+            local path="$1" entry
+            for entry in $2; do
+              entry="${entry#/}"
+              if [ "$path" = "$entry" ] || { [ "${entry%/}" != "$entry" ] && [ "${path#"$entry"}" != "$path" ]; }; then
+                return 0
+              fi
+            done
+            return 1
+          }
           faults=0
           while IFS=$'\t' read -r job where path sparse; do
             if [ "$where" = this ]; then
@@ -341,24 +392,42 @@ jobs:
               faults=$((faults + 1))
               continue
             fi
-            if [ -n "$sparse" ]; then
-              found=no
-              for entry in $sparse; do
-                entry="${entry#/}"
-                if [ "$path" = "$entry" ] || { [ "${entry%/}" != "$entry" ] && [ "${path#"$entry"}" != "$path" ]; }; then
-                  found=yes
-                fi
-              done
-              if [ "$found" = no ]; then
-                echo "the job ${job} runs ${path}, which is not in the sparse checkout of the job" >&2
-                faults=$((faults + 1))
-              fi
+            if [ -n "$sparse" ] && ! in_sparse "$path" "$sparse"; then
+              echo "the job ${job} runs ${path}, which is not in the sparse checkout of the job" >&2
+              faults=$((faults + 1))
             fi
           done < "${RUNNER_TEMP}/script-paths.tsv"
+          imports=0
+          while IFS=$'\t' read -r job sparse; do
+            for entry in $sparse; do
+              entry="${entry#/}"
+              case "$entry" in *.mjs) ;; *) continue ;; esac
+              if [ ! -f "source/${entry}" ]; then
+                echo "the sparse checkout of the job ${job} names ${entry}, which is not in the source at the tag commit" >&2
+                faults=$((faults + 1))
+                continue
+              fi
+              while IFS= read -r dep; do
+                imports=$((imports + 1))
+                if ! in_sparse "$dep" "$sparse"; then
+                  echo "the job ${job}: ${entry} imports ${dep}, which is not in the sparse checkout of the job" >&2
+                  faults=$((faults + 1))
+                fi
+              done < <(node --experimental-vm-modules --no-warnings -e '
+                const { readFileSync } = require("node:fs");
+                const { posix } = require("node:path");
+                const vm = require("node:vm");
+                const [file, entry] = process.argv.slice(1);
+                for (const spec of new vm.SourceTextModule(readFileSync(file, "utf8")).dependencySpecifiers) {
+                  if (spec.startsWith(".")) console.log(posix.normalize(posix.join(posix.dirname(entry), spec)));
+                }
+              ' "source/${entry}" "$entry")
+            done
+          done < "${RUNNER_TEMP}/sparse-sets.tsv"
           if [ "$faults" -ne 0 ]; then
             exit 1
           fi
-          echo "release: each script path is in the checkout of its job ($(wc -l < "${RUNNER_TEMP}/script-paths.tsv") paths)"
+          echo "release: each script path is in the checkout of its job ($(wc -l < "${RUNNER_TEMP}/script-paths.tsv") paths), and each relative import of a sparse set is in the set (${imports} imports)"
       # Build review A1: this run holds the signing secrets and the write token, so every
       # action of every workflow of this repository is named by a commit hash, which cannot
       # move. A tag such as `@v4` can move. The comment after the hash names the tag.
@@ -392,9 +461,9 @@ jobs:
             -shellcheck="${RUNNER_TEMP}/shellcheck" -pyflakes=
 
   # The Opengrep rules of the source (base design-01 3.4 and design-02 3.9 of the cleanup
-  # plan): the rule fixtures, then the scan of the source tree, then the scan of this file
-  # with the workflow rules (`release-workflow-guards.yml`). The scan of this file names
-  # its absolute path: a relative path into another git checkout gives no file to scan.
+  # plan): the rule fixtures, then the scan of the source tree, then the scan of this file and
+  # of `publish.yml` with the workflow rules (`release-workflow-guards.yml`). The scan names
+  # the absolute paths: a relative path into another git checkout gives no file to scan.
   static-rules:
     name: static-rules
     needs: resolve
@@ -425,8 +494,8 @@ jobs:
         run: npm ci
       - name: The rules and the scan of the source
         run: bash source/scripts/static-rules.sh
-      - name: The workflow rules on this release workflow
-        run: bash source/scripts/static-rules.sh "${GITHUB_WORKSPACE}/.github/workflows/release.yml"
+      - name: The workflow rules on the release workflows
+        run: bash source/scripts/static-rules.sh "${GITHUB_WORKSPACE}/.github/workflows/release.yml" "${GITHUB_WORKSPACE}/.github/workflows/publish.yml"
 
   backend:
     name: backend (${{ matrix.os }})
@@ -823,7 +892,7 @@ jobs:
         working-directory: backend
         env:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
-          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+          CHATMAN_RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: bun run build:sidecar:${{ matrix.triple }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -837,7 +906,7 @@ jobs:
         working-directory: manager/web
         env:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
-          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+          CHATMAN_RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: npm run build
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -930,7 +999,7 @@ jobs:
         working-directory: manager/web
         env:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
-          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+          CHATMAN_RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: npm run build
       - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
         with:
@@ -1064,7 +1133,7 @@ jobs:
         working-directory: backend
         env:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
-          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+          CHATMAN_RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: bun run build:sidecar:${{ matrix.triple }}
       - name: The built server starts
         if: runner.os == 'macOS'
@@ -1087,7 +1156,7 @@ jobs:
         working-directory: manager/web
         env:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
-          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+          CHATMAN_RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: npm run build
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -1155,7 +1224,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
-          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+          CHATMAN_RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # Next-batch plan, N11, item 5: Tauri signs, notarises and staples the `.app` on
@@ -1309,7 +1378,7 @@ jobs:
         working-directory: manager/web
         env:
           CHATMAN_RELEASE_REPO: ${{ github.repository }}
-          CHATMAN_RELEASE_TAG: ${{ inputs.tag }}
+          CHATMAN_RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: npm run build
       - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
         with:
@@ -1375,7 +1444,7 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.resolve.outputs.release_tag }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
@@ -1470,21 +1539,27 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  # The release is made here and nowhere else, after every other job. `!cancelled()`: a
-  # failed job does not skip this job; the first step names it and refuses.
+  # The draft release of the final tag is made here and nowhere else, after every other job.
+  # `!cancelled()`: a failed job does not skip this job; the first step names it and refuses.
+  # The group: one publish job of one final version at a time, in this workflow and in
+  # `publish.yml` (design V, DR3-5). A newer pending job cancels an older pending job of the
+  # group; the newer candidate replaces the draft of the older one.
   publish:
     name: publish
     needs: [resolve, workflow-guards, static-rules, backend, smoke-windows, frontend, python, rust, android-test, bundle, android, android-sign]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: publish-${{ needs.resolve.outputs.release_tag }}
+      cancel-in-progress: false
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
-      TAG: ${{ inputs.tag }}
-      MODE: ${{ inputs.draft && 'draft' || 'release' }}
+      TAG: ${{ needs.resolve.outputs.release_tag }}
+      CANDIDATE: ${{ needs.resolve.outputs.candidate_tag }}
       SRC_SHA: ${{ needs.resolve.outputs.sha }}
       CERT_SHA256: ${{ needs.android-sign.outputs.cert_sha256 }}
       # Next-batch plan, N9: the count line of the JVM tests that `android-test` printed.
@@ -1500,6 +1575,7 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
           sparse-checkout: |
+            backend/src/shared/version-grammar.mjs
             scripts/check-release-set.sh
             scripts/android-release-notes.sh
             scripts/publish-checks-cli.mjs
@@ -1538,8 +1614,8 @@ jobs:
       - name: Refuse unless the bundle set is complete
         run: bash scripts/check-release-set.sh files "$TAG" "${RUNNER_TEMP}/files.txt"
       - name: Create the release if it does not exist
-        run: bash scripts/publish-release.sh create "$MODE" "$TAG" "${RUNNER_TEMP}/files.txt" "$CERT_SHA256" "$SRC_SHA" "$JVM_TESTS"
+        run: bash scripts/publish-release.sh create "$TAG" "$CANDIDATE" "${RUNNER_TEMP}/files.txt" "$CERT_SHA256" "$SRC_SHA" "$JVM_TESTS"
       - name: Upload the bundles
         run: bash scripts/publish-release.sh upload "$TAG" "${RUNNER_TEMP}/files.txt"
-      - name: Verify the release carries the complete set
-        run: bash scripts/publish-release.sh verify "$MODE" "$TAG" dist/latest.json
+      - name: Verify the draft carries the complete set
+        run: bash scripts/publish-release.sh verify draft "$TAG" dist/latest.json

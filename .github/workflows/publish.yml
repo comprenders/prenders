@@ -1,0 +1,121 @@
+name: publish
+
+# The publish of a release of the app (release plan 2026-11-22, design V, section 3).
+# A candidate run of `release.yml` (the tag `vX.Y.Z-rcN` of the source) runs every test, builds
+# the final version X.Y.Z and keeps it as the draft release of the tag vX.Y.Z with the name
+# `Prenders vX.Y.Z-rcN`. This workflow publishes that draft. It runs no test and no build
+# (work-process rule 2b1: the full test set runs one time, in the candidate run).
+#
+# `scripts/release.sh publish` of the source makes the final tag vX.Y.Z at the commit of the
+# newest candidate, pushes it and starts this workflow. The scheduled workflow
+# `release-start.yml` of this repository is the backup start: it starts this workflow for a
+# final tag whose message is its own name. A person with write access can also start it by
+# hand.
+#
+# The steps: the tag is a final version (`scripts/version-check.mjs valid --final`); its
+# commit is on master of the source; `scripts/publish-release.sh promote` reads the tags of the
+# source, the runs of `release.yml` and the releases of the tag, and refuses unless
+# `promoteAction` (`scripts/publish-checks.mjs`) permits the publish: the newest candidate is
+# at the commit of the final tag, its newest run passed, every candidate run of the version is
+# completed, and the one draft has the name of the newest candidate. Then
+# `scripts/publish-release.sh verify release` checks the files of the draft, publishes it with
+# the name `Prenders vX.Y.Z` and checks the published files again. The candidate run checked
+# `latest.json` against the same draft, so this workflow gives no `latest.json`.
+#
+# The source is read with the read-only deploy key (secret SOURCE_DEPLOY_KEY) from the
+# repository named in the secret SOURCE_REPO.
+#
+# No `push:`, no `pull_request:` and no `schedule:`. Only a person with write access to this
+# repository and the workflow `release-start.yml` of this repository can start a run, so no
+# other person can reach the secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: A final tag vX.Y.Z of the source repository, at the commit of its newest candidate
+        required: true
+        type: string
+
+run-name: publish ${{ inputs.tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  # The group: one publish job of one final version at a time, here and in the job `publish`
+  # of `release.yml` (design V, DR3-5).
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: publish-${{ inputs.tag }}
+      cancel-in-progress: false
+    # `contents: write` publishes the draft; `actions: read` reads the runs of `release.yml`.
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Refuse a tag that is not v and a version
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9A-Za-z.-]+$ ]]; then
+            echo "publish: the tag \"${TAG}\" is not v followed by a version" >&2
+            exit 1
+          fi
+      # No `ref:`, so the default branch of the source. `fetch-depth: 0` fetches every branch
+      # and every tag, so the tag, its candidates and origin/master are all here. The sparse
+      # set holds only the scripts of the steps below and the files that they import or read.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: |
+            backend/src/shared/version-grammar.mjs
+            scripts/check-release-set.sh
+            scripts/publish-checks-cli.mjs
+            scripts/publish-checks.mjs
+            scripts/publish-release.sh
+            scripts/release-names-cli.mjs
+            scripts/release-names.mjs
+            scripts/release-notes.mjs
+            scripts/version-check.mjs
+            test-vectors/release-body-marks.json
+          sparse-checkout-cone-mode: false
+      - name: Resolve the tag and require its commit on master
+        id: sha
+        run: |
+          set -euo pipefail
+          if ! sha=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+            echo "publish: the source repository has no tag ${TAG}" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$sha" origin/master; then
+            echo "publish: the tag ${TAG} is at ${sha}, which is not on master" >&2
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "publish: ${TAG} is the source commit ${sha}"
+      # The scripts of the tag commit, not of master.
+      - name: Switch to the tag commit
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: git switch --quiet --detach "$SHA"
+      - name: Refuse a release candidate
+        run: node scripts/version-check.mjs valid --final "${TAG#v}"
+      - name: Refuse unless the newest candidate passed and its draft is the one release of the tag
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          id=$(bash scripts/publish-release.sh promote "$TAG" "$SHA" .)
+          echo "publish: the draft of ${TAG} (id ${id}) may be published"
+      - name: Publish the draft and verify the release carries the complete set
+        run: bash scripts/publish-release.sh verify release "$TAG"
