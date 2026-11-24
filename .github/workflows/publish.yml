@@ -81,6 +81,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           sparse-checkout: |
+            .node-version
             backend/src/shared/version-grammar.mjs
             scripts/check-release-set.sh
             scripts/publish-checks-cli.mjs
@@ -111,6 +112,10 @@ jobs:
         env:
           SHA: ${{ steps.sha.outputs.sha }}
         run: git switch --quiet --detach "$SHA"
+      # The Node of the version file of the tag commit runs every `node` step of this job.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
       - name: Refuse a release candidate
         run: node scripts/version-check.mjs valid --final "${TAG#v}"
       - name: Refuse unless the newest candidate passed and its draft is the one release of the tag

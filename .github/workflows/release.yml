@@ -132,6 +132,10 @@ jobs:
         env:
           SHA: ${{ steps.sha.outputs.sha }}
         run: git switch --quiet --detach "$SHA"
+      # The Node of the version file of the tag commit runs every `node` step of this job.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
       # A run of this workflow is a candidate run. The rule is `version-check.mjs` of the tag
       # commit: a final tag stops the run here, before any build (only `publish.yml`
       # publishes a final version), and so does a run with no `draft`.
@@ -211,6 +215,10 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: source/.bun-version
+      # The Node of the version file of the source runs the import step below (`node -e`).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: source/.node-version
       - name: Install backend dependencies for the Bun pin step
         working-directory: source/backend
         run: bun install --frozen-lockfile
@@ -1423,6 +1431,7 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
           sparse-checkout: |
+            .node-version
             android/release-cert.sha256
             backend/src/shared/version-grammar.mjs
             scripts/apk-checks-cli.mjs
@@ -1431,6 +1440,9 @@ jobs:
             scripts/release-names.mjs
             scripts/sign-apk.sh
           sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: android-unsigned
@@ -1495,9 +1507,13 @@ jobs:
           path: source
           persist-credentials: false
           sparse-checkout: |
+            .node-version
             scripts/check-android-test-list.mjs
             scripts/record-summary.mjs
           sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: source/.node-version
       # One folder for each time record artifact (no `merge-multiple`), so the list has one
       # part for each test job and each leg of a job.
       - name: Download the time records
@@ -1575,6 +1591,7 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
           sparse-checkout: |
+            .node-version
             backend/src/shared/version-grammar.mjs
             scripts/check-release-set.sh
             scripts/android-release-notes.sh
@@ -1590,6 +1607,9 @@ jobs:
             release-notes/
             test-vectors/release-body-marks.json
           sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
       - name: Refuse if any job did not succeed
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
@@ -1602,7 +1622,7 @@ jobs:
           merge-multiple: true
           path: dist
       # Before the list, so that `files.txt` names `dist/latest.json` and the upload sends
-      # it. The script reads the folder; the Node of the runner image runs it.
+      # it. The script reads the folder; the Node of the version file of the source runs it.
       - name: Write latest.json
         run: node scripts/updater-manifest.mjs write dist "$TAG" "$GH_REPO"
       - name: List the downloaded files
