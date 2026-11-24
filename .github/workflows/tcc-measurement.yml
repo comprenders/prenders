@@ -1,0 +1,119 @@
+name: tcc-measurement
+
+# Plan release-2026-11-24 (stt-server docs/chatman/v0.3/release-2026-11-24), design NA 4.3a, row
+# NA-3: one draft measurement of what a macOS runner gives for a Files and Folders access of the
+# sidecar call (`fs.promises.opendir` of `~/Desktop`, then `close`), in three states: no stored
+# choice (a new VM), a stored deny and a stored allow (a row that the job writes into the user TCC
+# database). The run note is `reports/tcc-measurement.md` of that plan folder. It is a measurement,
+# not a test: it builds nothing, publishes nothing, reads no secret and makes no `claude` call (no
+# credential for it is on record, so the run note states "not measured" for that caller).
+#
+# Owner order of 2026-11-24 (requirements.md of the plan): the measurement runs only on a GitHub
+# macOS runner, never on the owner's Mac. A person starts it by hand (workflow_dispatch only).
+
+on:
+  workflow_dispatch:
+
+run-name: tcc-measurement ~/Desktop opendir
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    # `macos-15` is the arm64 runner of this repository (release.yml builds aarch64-apple-darwin
+    # on it; `macos-15-intel` is the x64 runner).
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      SERVICE: kTCCServiceSystemPolicyDesktopFolder
+    steps:
+      - name: Record the runner
+        shell: bash
+        run: |
+          set -u
+          echo "macOS: $(sw_vers -productVersion) build $(sw_vers -buildVersion)"
+          echo "machine: $(uname -m)"
+          echo "user: $(id -un)"
+          echo "node: $(command -v node) $(node --version)"
+          echo "node real path: $(python3 -c 'import os,shutil;print(os.path.realpath(shutil.which("node")))')"
+          echo "home: $HOME"
+          # A stat of the folder, never a list of its entries.
+          if [ -d "$HOME/Desktop" ]; then echo "Desktop: a folder"; stat -f '%Sp %Su' "$HOME/Desktop"; else echo "Desktop: not found"; fi
+
+      - name: Write the probe
+        shell: bash
+        run: |
+          set -eu
+          # The probe of design NA 4.4a: one opendir and one close, no read of an entry. The
+          # parent bounds the child at 60 s (design NA 4.3a, step 1: a prompt with nobody at the
+          # screen can wait); a child that does not end is recorded as "no answer". The bound is
+          # a hang guard of this step, not a test wait.
+          cat > "$RUNNER_TEMP/probe-child.mjs" <<'EOF'
+          import * as fs from "node:fs";
+          try {
+            const dir = await fs.promises.opendir(process.argv[2]);
+            await dir.close();
+            console.log("success");
+          } catch (err) {
+            console.log(err && err.code ? String(err.code) : `error with no code: ${String(err)}`);
+          }
+          EOF
+          cat > "$RUNNER_TEMP/probe.mjs" <<'EOF'
+          import { spawn } from "node:child_process";
+          import * as fs from "node:fs";
+          const [state, folder, child] = process.argv.slice(2);
+          const started = Date.now();
+          const proc = spawn(process.execPath, [child, folder], { stdio: ["ignore", "pipe", "pipe"] });
+          let out = "";
+          proc.stdout.on("data", (d) => { out += d; });
+          proc.stderr.on("data", (d) => { process.stderr.write(d); });
+          const bound = setTimeout(() => { proc.kill("SIGKILL"); }, 60_000);
+          proc.on("close", (code, signal) => {
+            clearTimeout(bound);
+            const result = signal === "SIGKILL" ? "no answer" : out.trim() || `no output, exit ${code}`;
+            const line = `STATE ${state} | sidecar opendir: ${result} | ${Date.now() - started} ms`;
+            console.log(line);
+            if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `- ${line}\n`);
+          });
+          EOF
+
+      - name: "State: no stored choice (a new VM)"
+        shell: bash
+        run: |
+          set -u
+          db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          echo "The rows of the service before the probe:"
+          sudo sqlite3 "$db" "SELECT client, client_type, auth_value, auth_reason FROM access WHERE service = '$SERVICE';" || echo "the read of the user TCC database failed"
+          node "$RUNNER_TEMP/probe.mjs" "no stored choice" "$HOME/Desktop" "$RUNNER_TEMP/probe-child.mjs"
+
+      - name: Record the schema of the access table
+        shell: bash
+        run: |
+          set -u
+          sudo sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" ".schema access" || echo "the read of the schema failed"
+
+      - name: "State: stored deny"
+        shell: bash
+        run: |
+          set -u
+          db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          client="$(python3 -c 'import os,shutil;print(os.path.realpath(shutil.which("node")))')"
+          # auth_value 0: deny. client_type 1: the client is a path. The other values are
+          # recorded as written; the run note states which of them has a source.
+          sudo sqlite3 "$db" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) VALUES ('$SERVICE', '$client', 1, 0, 3, 1, 0, CAST(strftime('%s','now') AS INTEGER));" \
+            && echo "the deny row was written for $client" || echo "the write of the deny row failed"
+          sudo sqlite3 "$db" "SELECT client, client_type, auth_value, auth_reason FROM access WHERE service = '$SERVICE';" || true
+          node "$RUNNER_TEMP/probe.mjs" "stored deny" "$HOME/Desktop" "$RUNNER_TEMP/probe-child.mjs"
+
+      - name: "State: stored allow"
+        shell: bash
+        run: |
+          set -u
+          db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          client="$(python3 -c 'import os,shutil;print(os.path.realpath(shutil.which("node")))')"
+          # auth_value 2: allow.
+          sudo sqlite3 "$db" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) VALUES ('$SERVICE', '$client', 1, 2, 3, 1, 0, CAST(strftime('%s','now') AS INTEGER));" \
+            && echo "the allow row was written for $client" || echo "the write of the allow row failed"
+          sudo sqlite3 "$db" "SELECT client, client_type, auth_value, auth_reason FROM access WHERE service = '$SERVICE';" || true
+          node "$RUNNER_TEMP/probe.mjs" "stored allow" "$HOME/Desktop" "$RUNNER_TEMP/probe-child.mjs"
